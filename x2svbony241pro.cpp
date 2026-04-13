@@ -8,6 +8,16 @@
 #include <time.h>
 #include <stdlib.h>
 
+#if defined(SB_LINUX_BUILD) || defined(SB_MACOSX_BUILD)
+#  include <fcntl.h>
+#  include <unistd.h>
+#  include <sys/ioctl.h>
+#  include <termios.h>
+#endif
+
+// Forward declaration — defined near drainBootLog() below
+static void resetEsp32ViaDtr(const char* pszPort, int assertMs, int bootWaitMs);
+
 // ---------------------------------------------------------------------------
 // Circuit name table — keep in sync with X2 circuit index definitions
 // ---------------------------------------------------------------------------
@@ -44,12 +54,18 @@ static const int     kBaudRate              = 115200;
 static const uint8_t kFrameHeader           = 0x24;
 static const uint8_t kStatusFailure         = 0xAA;
 
-static const int     kPostWriteSleepMs      = 50;   // post-write settling time (was 100 ms)
+static const int     kPostWriteSleepMs      = 100;  // post-write settling (match INDI driver)
 static const int     kReadTimeoutMs         = 500;  // max wait for response bytes
-static const int     kBootDrainInitSleepMs  = 300;  // initial wait for ESP32 boot (was 500 ms)
-static const int     kBootDrainRetries      = 6;    // max drain iterations (was 10)
-static const int     kBootDrainSleepMs      = 30;   // sleep between drain reads (was 50 ms)
-static const int     kBootDrainMaxMs        = 400;  // hard wall-clock cap for entire drain phase
+static const int     kBootDrainInitSleepMs  = 500;  // initial wait for ESP32 boot (match INDI)
+static const int     kBootDrainRetries      = 6;    // max drain iterations
+static const int     kBootDrainSleepMs      = 30;   // sleep between drain reads
+static const int     kBootDrainMaxMs        = 2000; // hard wall-clock cap (match INDI's ~6 s budget)
+// Timeout passed to readFile() during the drain phase.  This MUST be short —
+// readFile() blocks for up to dwTimeOut ms waiting for bytes.  The default is
+// 1000 ms, which means the wall-clock cap cannot fire until AFTER readFile()
+// returns, adding up to 1000 ms per iteration and making the cap useless.
+// 50 ms is enough to drain whatever arrived during kBootDrainSleepMs.
+static const int     kBootDrainReadTimeoutMs = 50;
 static const int     kPowerCycleSleepMs     = 1000;
 
 // Default analogue levels used when toggling an analogue channel ON for the first time
@@ -328,32 +344,64 @@ int X2Svbony241Pro::establishLink()
     loadDebugLevel();
     loadDewConfig();
 
-    // Drain the ESP32 boot log.  The device resets when the serial port opens;
-    // we must consume the boot text before sending binary commands.
-    // Non-fatal: if drain times out we attempt the handshake anyway.
-    (void)drainBootLog();
+    // -----------------------------------------------------------------------
+    // Handshake strategy: try once without disturbing the device.
+    //
+    // If the ESP32 is already running (e.g. second connect, or the port was
+    // not reset by SerXInterface::open()), it will respond immediately and we
+    // avoid an unnecessary reset that would briefly cut power to all outputs.
+    //
+    // If the first attempt times out — typically because the CH341 left DTR
+    // asserted and the ESP32 is stuck in reset — we toggle DTR to force a
+    // clean reboot, drain the resulting boot log, and try once more.
+    // -----------------------------------------------------------------------
 
-    int nAfterDrainMs = m_pTickCount ? (m_pTickCount->elapsed() - nLinkStartTick) : -1;
-    logDebug(kDebugErrors, "X2Svbony241Pro: drain phase done at +%d ms — starting handshake",
-             nAfterDrainMs);
-
-    // Handshake: cmd 0x08 (full state query).  Set m_bLinked now so that
-    // sendFrame's guard passes.  If the handshake fails, clear m_bLinked
-    // before closing the port so the driver is left in a clean "not connected"
-    // state and no subsequent I/O is attempted on the closed port.
+    // Attempt 1: device already running, no reset needed.
     m_bLinked = true;
-
     uint8_t state10[10] = {0};
     nErr = cmdGetState(state10);
-    if (nErr != SB_OK)
+    if (nErr == SB_OK)
     {
-        int nFailMs = m_pTickCount ? (m_pTickCount->elapsed() - nLinkStartTick) : -1;
+        // Device responded immediately — we're done.
+        logDebug(kDebugErrors, "X2Svbony241Pro: handshake OK on first attempt (no reset needed)");
+    }
+    else
+    {
+        // First attempt failed.  Reset the ESP32 via DTR and retry.
+        int nFirstFailMs = m_pTickCount ? (m_pTickCount->elapsed() - nLinkStartTick) : -1;
         logDebug(kDebugErrors,
-                 "X2Svbony241Pro: handshake failed at +%d ms (err %d) — closing port",
-                 nFailMs, nErr);
-        m_bLinked = false;
-        m_pSerX->close();
-        return nErr;
+                 "X2Svbony241Pro: first handshake attempt failed at +%d ms (err %d) "
+                 "— resetting ESP32 via DTR and retrying",
+                 nFirstFailMs, nErr);
+
+        m_bLinked = false;  // keep guard down while we reset + drain
+
+        // Toggle DTR: assert (ESP32 EN LOW = reset) then release (EN HIGH = boot).
+        resetEsp32ViaDtr(sPortName.c_str(), 200 /*assertMs*/, 100 /*preBootMs*/);
+
+        // Drain the boot log before sending binary commands.
+        (void)drainBootLog();
+
+        int nAfterDrainMs = m_pTickCount ? (m_pTickCount->elapsed() - nLinkStartTick) : -1;
+        logDebug(kDebugErrors,
+                 "X2Svbony241Pro: drain phase done at +%d ms — starting handshake (attempt 2)",
+                 nAfterDrainMs);
+
+        m_bLinked = true;
+        memset(state10, 0, sizeof(state10));
+        nErr = cmdGetState(state10);
+        if (nErr != SB_OK)
+        {
+            int nFailMs = m_pTickCount ? (m_pTickCount->elapsed() - nLinkStartTick) : -1;
+            logDebug(kDebugErrors,
+                     "X2Svbony241Pro: handshake failed after reset at +%d ms (err %d) — closing port",
+                     nFailMs, nErr);
+            m_bLinked = false;
+            m_pSerX->close();
+            return nErr;
+        }
+
+        logDebug(kDebugErrors, "X2Svbony241Pro: handshake OK after DTR reset");
     }
 
     parseStateResponse(state10);
@@ -552,15 +600,6 @@ int X2Svbony241Pro::sendFrame(const uint8_t* pCmd, int nCmdLen,
     int nFrameLen = 0;
     buildFrame(pCmd, nCmdLen, frame, nFrameLen);
 
-    if (m_nDebugLevel >= kDebugFullIO)
-    {
-        char szHex[64];
-        int pos = 0;
-        for (int i = 0; i < nFrameLen && pos < (int)sizeof(szHex) - 4; ++i)
-            pos += snprintf(szHex + pos, sizeof(szHex) - pos, "%02X ", frame[i]);
-        logDebug(kDebugFullIO, "X2Svbony241Pro: TX [%s]", szHex);
-    }
-
     // Flush stale bytes before writing
     m_pSerX->purgeTxRx();
 
@@ -576,6 +615,19 @@ int X2Svbony241Pro::sendFrame(const uint8_t* pCmd, int nCmdLen,
     {
         logDebug(kDebugErrors, "X2Svbony241Pro: short write %lu/%d", nWritten, nFrameLen);
         return ERR_CMDFAILED;
+    }
+
+    // Force bytes out of the OS TX buffer — equivalent to INDI's tcdrain().
+    // Without this, bytes may sit in the kernel buffer and never reach the device.
+    m_pSerX->flushTx();
+
+    if (m_nDebugLevel >= kDebugFullIO)
+    {
+        char szHex[64];
+        int pos = 0;
+        for (int i = 0; i < nFrameLen && pos < (int)sizeof(szHex) - 4; ++i)
+            pos += snprintf(szHex + pos, sizeof(szHex) - pos, "%02X ", frame[i]);
+        logDebug(kDebugFullIO, "X2Svbony241Pro: TX [%s]", szHex);
     }
 
     // Post-write sleep: mirrors the INDI driver's tcdrain() + 100 ms sleep
@@ -631,51 +683,41 @@ int X2Svbony241Pro::sendFrame(const uint8_t* pCmd, int nCmdLen,
 // Reads exactly nExpectedBytes from the serial port.
 // Retries every 1 ms up to kReadTimeoutMs total *elapsed* time.
 //
-// IMPORTANT: nElapsed counts every loop iteration (not just idle ones).
-// This is a hard wall-clock budget: even if the device sends a trickle of
-// bytes, we will never wait longer than kReadTimeoutMs milliseconds.
-// The previous implementation reset the idle counter on any byte received,
-// which allowed a chatty or misbehaving device to hold readFrame() open
-// indefinitely, locking the TheSkyX UI thread during establishLink().
+// Use waitForBytesRx() + readFile() — the correct TSX pattern.
+// waitForBytesRx() blocks efficiently for up to kReadTimeoutMs ms waiting
+// for at least one byte to arrive, then readFile() collects whatever is
+// buffered.  This avoids fighting with SerXInterface's internal timeout
+// handling in readFile() (which may ignore small dwTimeOut values).
 // ---------------------------------------------------------------------------
 int X2Svbony241Pro::readFrame(int nExpectedBytes, uint8_t* pBufOut)
 {
-    int nRead    = 0;
-    int nElapsed = 0;   // total ms budget consumed (hard deadline)
+    int nRead = 0;
 
-    while (nRead < nExpectedBytes && nElapsed < kReadTimeoutMs)
+    while (nRead < nExpectedBytes)
     {
+        // Wait for at least one more byte within our deadline.
+        int nErr = m_pSerX->waitForBytesRx(1, kReadTimeoutMs);
+        if (nErr != SB_OK)
+        {
+            logDebug(kDebugErrors,
+                     "X2Svbony241Pro: waitForBytesRx timeout/error %d (%d/%d bytes)",
+                     nErr, nRead, nExpectedBytes);
+            return ERR_TXTIMEOUT;
+        }
+
+        // Drain whatever arrived — readFile with a short timeout to avoid blocking.
         unsigned long nGot = 0;
-        int nErr = m_pSerX->readFile(pBufOut + nRead,
-                                     (unsigned long)(nExpectedBytes - nRead),
-                                     nGot);
+        nErr = m_pSerX->readFile(pBufOut + nRead,
+                                 (unsigned long)(nExpectedBytes - nRead),
+                                 nGot,
+                                 (unsigned long)kReadTimeoutMs);
         if (nErr != SB_OK)
         {
             logDebug(kDebugErrors, "X2Svbony241Pro: readFile error %d", nErr);
             return nErr;
         }
 
-        if (nGot == 0)
-        {
-            // No bytes yet — burn 1 ms of the hard budget and try again.
-            ++nElapsed;
-            if (m_pSleeper) m_pSleeper->sleep(1);
-        }
-        else
-        {
-            nRead    += (int)nGot;
-            // Count this iteration against the budget too: each readFile call
-            // costs roughly 1 ms even when it returns bytes.  This keeps the
-            // budget conservative and prevents an infinite trickle of bytes
-            // from extending the wait past kReadTimeoutMs.
-            ++nElapsed;
-        }
-    }
-
-    if (nRead < nExpectedBytes)
-    {
-        logDebug(kDebugErrors, "X2Svbony241Pro: read timeout (%d/%d bytes)", nRead, nExpectedBytes);
-        return ERR_TXTIMEOUT;
+        nRead += (int)nGot;
     }
 
     return SB_OK;
@@ -696,18 +738,88 @@ int X2Svbony241Pro::readFrame(int nExpectedBytes, uint8_t* pBufOut)
 // discard until we see kQuietTarget consecutive quiet reads (no bytes
 // arriving), or until the hard wall-clock cap kBootDrainMaxMs elapses.
 //
+// CRITICAL: readFile() blocks for up to dwTimeOut ms waiting for bytes.
+// The SerXInterface default is 1000 ms.  Each drain loop iteration calls
+// readFile(), so without an explicit short timeout the effective per-iteration
+// cost is kBootDrainSleepMs + 1000 ms = ~1030 ms, and the wall-clock cap
+// (checked only at the top of the loop, before readFile) cannot fire until
+// after readFile() returns — adding up to 1000 ms of extra latency per
+// iteration.  We therefore always pass kBootDrainReadTimeoutMs (50 ms) to
+// readFile() so the cap is effective and the total drain time is bounded.
+//
 // The wall-clock cap is the critical safety net: without it a continuously
 // chatty device (wrong port, modem, still-booting device with a long log)
 // would hold the TSX UI thread blocked for up to
-//   kBootDrainInitSleepMs + kBootDrainRetries × kBootDrainSleepMs
-// milliseconds, making TheSkyX appear frozen.  The cap ensures the drain
-// phase never takes more than kBootDrainMaxMs ms in total.
+//   kBootDrainInitSleepMs + kBootDrainRetries × (kBootDrainSleepMs + kBootDrainReadTimeoutMs)
+// milliseconds, making TheSkyX appear frozen.  The cap plus the short
+// readFile timeout ensures the drain phase never takes meaningfully more
+// than kBootDrainMaxMs ms in total.
 //
 // Note: the INDI driver uses ioctl(TIOCMSET) to explicitly clear RTS and DTR
 // before draining.  SerXInterface does not expose ioctl, so we rely on the
 // USB-CDC chip's built-in auto-reset behavior, which is present on standard
 // ESP32 DevKit hardware.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// resetEsp32ViaDtr
+//
+// The SV241 Pro uses an ESP32 wired to the CH341 USB-UART bridge.
+// The CH341 maps DTR → ESP32 EN (active-low reset).  Asserting DTR pulls EN
+// low (reset); releasing DTR lets EN go high and the ESP32 boots.
+//
+// TSX's SerXInterface::open() may or may not assert DTR depending on the OS
+// and driver.  If a previous session left DTR asserted, the ESP32 stays in
+// reset and never responds.  We therefore toggle DTR explicitly every time we
+// open the port, guaranteeing a clean boot sequence.
+//
+// Implementation: open a second file descriptor to the same device just long
+// enough to manipulate the modem control lines, then close it.  This is safe
+// because the CH341 is a USB-CDC device — multiple opens share the same USB
+// endpoint and the second fd does not steal I/O from SerXInterface.
+//
+// Platform: Linux and macOS only.  On Windows, SerXInterface handles DTR
+// implicitly and the CH341 WinUSB/COM driver behaves differently; we skip the
+// ioctl path there and rely on SerXInterface to reset the device on open.
+// ---------------------------------------------------------------------------
+static void resetEsp32ViaDtr(const char* pszPort, int assertMs, int bootWaitMs)
+{
+#if defined(SB_LINUX_BUILD) || defined(SB_MACOSX_BUILD)
+    int fd = ::open(pszPort, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0)
+        return;  // non-fatal
+
+    int modem = 0;
+    ::ioctl(fd, TIOCMGET, &modem);
+
+    // Assert DTR → ESP32 EN LOW → reset
+    modem |= TIOCM_DTR;
+    ::ioctl(fd, TIOCMSET, &modem);
+
+    // Hold in reset for assertMs milliseconds
+    struct timespec ts;
+    ts.tv_sec  = assertMs / 1000;
+    ts.tv_nsec = (assertMs % 1000) * 1000000L;
+    ::nanosleep(&ts, NULL);
+
+    // Release DTR → ESP32 EN HIGH → boot
+    modem &= ~TIOCM_DTR;
+    ::ioctl(fd, TIOCMSET, &modem);
+
+    ::close(fd);
+
+    // Give the ESP32 time to run through its ROM bootloader before the caller
+    // tries to drain the boot log.  The drain adds its own kBootDrainInitSleepMs;
+    // this sleep is intentionally short so the total delay stays reasonable.
+    ts.tv_sec  = bootWaitMs / 1000;
+    ts.tv_nsec = (bootWaitMs % 1000) * 1000000L;
+    ::nanosleep(&ts, NULL);
+#else
+    (void)pszPort;
+    (void)assertMs;
+    (void)bootWaitMs;
+#endif
+}
+
 int X2Svbony241Pro::drainBootLog()
 {
     // No mutex needed here: drainBootLog() is only ever called from
@@ -758,7 +870,12 @@ int X2Svbony241Pro::drainBootLog()
             m_pSleeper->sleep(kBootDrainSleepMs);
 
         unsigned long nRead = 0;
-        m_pSerX->readFile(discard, sizeof(discard), nRead);
+        // Pass kBootDrainReadTimeoutMs explicitly — do NOT rely on the 1000 ms
+        // default.  Without this, readFile blocks for up to 1000 ms per call,
+        // which completely defeats the kBootDrainMaxMs wall-clock cap (the cap
+        // is only checked at the top of the loop, so each readFile call can add
+        // a full second of latency before the cap fires on the next iteration).
+        m_pSerX->readFile(discard, sizeof(discard), nRead, kBootDrainReadTimeoutMs);
         nTotalRead += (int)nRead;
 
         if (nRead == 0)
