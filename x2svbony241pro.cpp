@@ -2,31 +2,57 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 // ---------------------------------------------------------------------------
-// Circuit names — keep in sync with the index definitions in x2svbony241pro.h
+// Circuit name table — keep in sync with X2 circuit index definitions
 // ---------------------------------------------------------------------------
 static const char* kCircuitNames[X2_NUM_CIRCUITS] =
 {
-    "DC Port 1 (12V)",          // 0
-    "DC Port 2 (12V)",          // 1
-    "DC Port 3 (12V)",          // 2
-    "DC Port 4 (12V)",          // 3
-    "Dew Heater 1",             // 4
-    "Dew Heater 2",             // 5
-    "USB Hub Power",            // 6
-    "Adjustable Output"         // 7
+    "DC Port 1 (12V)",      // 0
+    "DC Port 2 (12V)",      // 1
+    "DC Port 3 (12V)",      // 2
+    "DC Port 4 (12V)",      // 3
+    "Dew Heater 1",         // 4
+    "Dew Heater 2",         // 5
+    "USB Hub Power",        // 6
+    "Adjustable Output",    // 7
 };
 
-// Serial baud rate used when opening the virtual COM port exposed by the
-// SV241 Pro USB hub.
-static const int kBaudRate = 115200;
-
-// Maximum number of bytes expected in a single device response line.
-static const int kRespBufLen = 256;
+// Device port_index byte (for cmd 0x01), indexed by X2 circuit number.
+// See PROTOCOL.md §7–10 for full mapping.
+static const uint8_t kPortIndex[X2_NUM_CIRCUITS] =
+{
+    0x00,   // Circuit 0 → DC 1
+    0x01,   // Circuit 1 → DC 2
+    0x02,   // Circuit 2 → DC 3
+    0x03,   // Circuit 3 → DC 4
+    0x08,   // Circuit 4 → Dew Heater 1 (PWM 1)
+    0x09,   // Circuit 5 → Dew Heater 2 (PWM 2)
+    0x05,   // Circuit 6 → USB group 0 (USB-C, USB1, USB2)
+    0x07,   // Circuit 7 → Regulated voltage output
+};
 
 // ---------------------------------------------------------------------------
-// Constructor / Destructor
+// Protocol / timing constants
+// ---------------------------------------------------------------------------
+static const int     kBaudRate              = 115200;
+static const uint8_t kFrameHeader           = 0x24;
+static const uint8_t kStatusFailure         = 0xAA;
+
+static const int     kPostWriteSleepMs      = 100;  // mirrors INDI tcdrain+sleep
+static const int     kReadTimeoutMs         = 500;  // max wait for response bytes
+static const int     kBootDrainInitSleepMs  = 500;  // initial wait for ESP32 boot
+static const int     kBootDrainRetries      = 10;
+static const int     kBootDrainSleepMs      = 50;
+static const int     kPowerCycleSleepMs     = 1000;
+
+// Default analogue levels used when toggling an analogue channel ON for the first time
+static const int     kDefaultDewDutyPct         = 50;    // 50 % PWM duty cycle
+static const double  kDefaultRegulatedVoltageV  = 12.0;  // 12 V
+
+// ---------------------------------------------------------------------------
+// Constructor
 // ---------------------------------------------------------------------------
 
 X2Svbony241Pro::X2Svbony241Pro(
@@ -39,21 +65,35 @@ X2Svbony241Pro::X2Svbony241Pro(
     LoggerInterface*                    pLoggerIn,
     MutexInterface*                     pIOMutexIn,
     TickCountInterface*                 pTickCountIn)
-    : m_pSerX       (pSerXIn)
-    , m_pTheSkyX    (pTheSkyXIn)
-    , m_pSleeper    (pSleeperIn)
-    , m_pIniUtil    (pIniUtilIn)
-    , m_pLogger     (pLoggerIn)
-    , m_pIOMutex    (pIOMutexIn)
-    , m_pTickCount  (pTickCountIn)
-    , m_nInstanceIndex(nInstanceIndex)
-    , m_bLinked     (false)
+    : m_pSerX               (pSerXIn)
+    , m_pTheSkyX            (pTheSkyXIn)
+    , m_pSleeper            (pSleeperIn)
+    , m_pIniUtil            (pIniUtilIn)
+    , m_pLogger             (pLoggerIn)
+    , m_pIOMutex            (pIOMutexIn)
+    , m_pTickCount          (pTickCountIn)
+    , m_nInstanceIndex      (nInstanceIndex)
+    , m_bLinked             (false)
+    , m_dPowerW             (0.0)
+    , m_dVoltageV           (0.0)
+    , m_dCurrentA           (0.0)
+    , m_dDS18B20TempC       (0.0)
+    , m_dSHT40TempC         (0.0)
+    , m_dSHT40HumidityPct   (0.0)
+    , m_dRegulatedVoltageV  (kDefaultRegulatedVoltageV)
 {
-    (void)pszDisplayName;   // not used in this driver
+    (void)pszDisplayName;   // display name is managed by TheSkyX
 
     for (int i = 0; i < X2_NUM_CIRCUITS; ++i)
         m_bCircuitState[i] = false;
+
+    m_nDewDutyPct[0] = kDefaultDewDutyPct;
+    m_nDewDutyPct[1] = kDefaultDewDutyPct;
 }
+
+// ---------------------------------------------------------------------------
+// Destructor
+// ---------------------------------------------------------------------------
 
 X2Svbony241Pro::~X2Svbony241Pro()
 {
@@ -69,14 +109,9 @@ X2Svbony241Pro::~X2Svbony241Pro()
 int X2Svbony241Pro::queryAbstraction(const char* pszName, void** ppVal)
 {
     *ppVal = NULL;
-
     if (!strcmp(pszName, LoggerInterface::IID_LoggerInterface))
-    {
         *ppVal = m_pLogger;
-        return SB_OK;
-    }
-
-    return SB_OK;   // unknown interface — return SB_OK with *ppVal == NULL
+    return SB_OK;   // return SB_OK even for unknown interfaces (*ppVal == NULL)
 }
 
 // ---------------------------------------------------------------------------
@@ -86,56 +121,37 @@ int X2Svbony241Pro::queryAbstraction(const char* pszName, void** ppVal)
 void X2Svbony241Pro::driverInfoDetailedInfo(BasicStringInterface& str) const
 {
     str = "X2 Power Control driver for the SVBony SV241 Pro USB Power Hub. "
-          "Supports 4 x 12V DC outputs, 2 x dew heater ports (PWM), "
-          "USB hub power, and one adjustable output. "
-          "Written as an open-source community driver. "
-          "USB serial protocol stubs are present — see TODO comments in "
-          "x2svbony241pro.cpp for details.";
+          "Supports 4 x 12V DC outputs, 2 x dew heater ports (PWM 0-100%), "
+          "integrated USB hub power, and one adjustable voltage output (0-15.3V). "
+          "Environmental sensors: INA219 (power/voltage/current), "
+          "DS18B20 (lens temperature), SHT40 (ambient temperature & humidity).";
 }
 
-double X2Svbony241Pro::driverInfoVersion() const
-{
-    return 1.0;
-}
+double X2Svbony241Pro::driverInfoVersion() const { return 1.0; }
 
 // ---------------------------------------------------------------------------
 // DeviceInfoInterface
 // ---------------------------------------------------------------------------
 
 void X2Svbony241Pro::deviceInfoNameShort(BasicStringInterface& str) const
-{
-    str = "SVBony SV241 Pro";
-}
+    { str = "SVBony SV241 Pro"; }
 
 void X2Svbony241Pro::deviceInfoNameLong(BasicStringInterface& str) const
-{
-    str = "SVBony SV241 Pro USB Power Hub";
-}
+    { str = "SVBony SV241 Pro USB Power Hub"; }
 
 void X2Svbony241Pro::deviceInfoDetailedDescription(BasicStringInterface& str) const
 {
-    str = "SVBony SV241 Pro — USB-connected astronomy power control box and "
-          "USB hub. Features: 4 x switchable 12V DC output ports, "
-          "2 x PWM-controlled dew heater ports (0-100%), "
-          "integrated USB hub, 1 x adjustable voltage output, "
-          "and per-port current/voltage monitoring.";
+    str = "SVBony SV241 Pro — USB-connected astronomy power control box and USB hub. "
+          "4 x switchable 12V DC outputs, 2 x PWM dew heater ports, "
+          "USB hub (2 groups), 1 x adjustable voltage output (0-15.3V), "
+          "INA219 power monitor, DS18B20 and SHT40 environmental sensors.";
 }
 
 void X2Svbony241Pro::deviceInfoFirmwareVersion(BasicStringInterface& str)
-{
-    // TODO: Once the USB serial protocol is known, issue a firmware-query
-    //       command here and return the actual version string reported by
-    //       the device.  For now return a placeholder.
-    if (m_bLinked)
-        str = "Unknown (query not yet implemented)";
-    else
-        str = "N/A";
-}
+    { str = m_bLinked ? "ESP32 firmware (version not reported by device)" : "N/A"; }
 
 void X2Svbony241Pro::deviceInfoModel(BasicStringInterface& str)
-{
-    str = "SV241 Pro";
-}
+    { str = "SV241 Pro"; }
 
 // ---------------------------------------------------------------------------
 // LinkInterface
@@ -146,18 +162,32 @@ int X2Svbony241Pro::establishLink()
     if (m_pSerX == NULL)
         return ERR_COMMNOLINK;
 
-    // Open the serial (virtual COM) port at 115200 8N1.
-    // TheSkyX will have already configured the port name via the UI.
+    // Open the USB virtual COM port at 115200 8N1, no parity, no flow control.
     int nErr = m_pSerX->open(NULL, kBaudRate, SerXInterface::B_NOPARITY, 0);
     if (nErr != SB_OK)
         return nErr;
 
     m_bLinked = true;
 
-    // Query the device to obtain the initial state of all circuits.
-    // If this fails we still consider ourselves linked — the cached state
-    // (all-off) will be used until a successful command round-trip occurs.
-    (void)queryAllCircuitStates();
+    // Drain the ESP32 boot log.  The device resets when the serial port opens;
+    // we must consume the boot text before sending binary commands.
+    // Non-fatal: if drain times out we attempt the handshake anyway.
+    (void)drainBootLog();
+
+    // Handshake: cmd 0x08 (full state query).  If the device responds correctly
+    // we consider the link established and pre-populate the circuit cache.
+    uint8_t state10[10] = {0};
+    nErr = cmdGetState(state10);
+    if (nErr != SB_OK)
+    {
+        if (m_pLogger)
+            m_pLogger->out("X2Svbony241Pro: handshake failed — closing port");
+        m_pSerX->close();
+        m_bLinked = false;
+        return nErr;
+    }
+
+    parseStateResponse(state10);
 
     if (m_pLogger)
         m_pLogger->out("X2Svbony241Pro: link established");
@@ -178,10 +208,7 @@ int X2Svbony241Pro::terminateLink()
     return SB_OK;
 }
 
-bool X2Svbony241Pro::isLinked() const
-{
-    return m_bLinked;
-}
+bool X2Svbony241Pro::isLinked() const { return m_bLinked; }
 
 // ---------------------------------------------------------------------------
 // PowerControlDriverInterface
@@ -208,7 +235,6 @@ int X2Svbony241Pro::circuitState(const int& nIndex, bool& bOn)
 {
     if (!m_bLinked)
         return ERR_COMMNOLINK;
-
     if (nIndex < 0 || nIndex >= X2_NUM_CIRCUITS)
         return ERR_DATAOUT_OF_RANGE;
 
@@ -220,169 +246,570 @@ int X2Svbony241Pro::setCircuitState(const int& nIndex, const bool& bOn)
 {
     if (!m_bLinked)
         return ERR_COMMNOLINK;
-
     if (nIndex < 0 || nIndex >= X2_NUM_CIRCUITS)
         return ERR_DATAOUT_OF_RANGE;
 
-    // -----------------------------------------------------------------------
-    // TODO: Replace this stub with the actual USB serial command required to
-    //       switch circuit `nIndex` on (bOn == true) or off (bOn == false).
-    //
-    // The SV241 Pro USB serial protocol has not yet been documented or
-    // reverse-engineered.  The expected command format and response format
-    // are unknown at the time of writing.
-    //
-    // Suggested approach once the protocol is known:
-    //
-    //   char szCmd[64];
-    //   char szResp[kRespBufLen];
-    //   snprintf(szCmd, sizeof(szCmd), "SET %d %s\r\n",
-    //            nIndex, bOn ? "ON" : "OFF");
-    //   int nErr = sendCommand(szCmd, szResp, kRespBufLen);
-    //   if (nErr != SB_OK)
-    //       return nErr;
-    //   // Parse szResp to confirm acknowledgement ...
-    //
-    // For now, just update the local state cache and return success so that
-    // the TheSkyX UI reflects the requested state immediately during testing.
-    // -----------------------------------------------------------------------
+    uint8_t portIdx = portIndexForCircuit(nIndex);
+    uint8_t value   = bOn ? onValueForCircuit(nIndex) : static_cast<uint8_t>(0x00);
 
-    if (m_pLogger)
-    {
-        char szMsg[128];
-        snprintf(szMsg, sizeof(szMsg),
-                 "X2Svbony241Pro: setCircuitState(%d, %s) — STUB, no actual device command sent",
-                 nIndex, bOn ? "ON" : "OFF");
-        m_pLogger->out(szMsg);
-    }
+    int nErr = cmdSetPort(portIdx, value);
+    if (nErr != SB_OK)
+        return nErr;
 
     m_bCircuitState[nIndex] = bOn;
     return SB_OK;
 }
 
-// ---------------------------------------------------------------------------
-// Private helpers
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Binary frame I/O — private implementation
+// ===========================================================================
 
-int X2Svbony241Pro::sendCommand(const char* pszCmd, char* pszResp, const int nRespLen)
+// ---------------------------------------------------------------------------
+// buildFrame
+//
+// Constructs the complete binary command frame:
+//   [0x24 | DATA_LEN | cmd[0..nCmdLen-1] | CHECKSUM]
+// where DATA_LEN = nCmdLen + 3  (see PROTOCOL.md §3).
+// pFrameOut must be at least nCmdLen+3 bytes.
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::buildFrame(const uint8_t* pCmd, int nCmdLen,
+                                uint8_t* pFrameOut, int& nFrameLenOut) const
 {
-    if (!m_bLinked || m_pSerX == NULL)
-        return ERR_COMMNOLINK;
-
-    // Flush any stale data already sitting in the receive buffer.
-    m_pSerX->purgeTxRx();
-
-    // Write the command string.
-    unsigned long nBytesWritten = 0;
-    int nLen = (int)strlen(pszCmd);
-    int nErr = m_pSerX->writeFile((void*)pszCmd, nLen, nBytesWritten);
-    if (nErr != SB_OK)
-    {
-        if (m_pLogger)
-            m_pLogger->out("X2Svbony241Pro: sendCommand — writeFile failed");
-        return nErr;
-    }
-
-    // Read back the response.
-    return readResponse(pszResp, nRespLen);
+    int nFrameLen = nCmdLen + 3;        // header + data_len + cmd... + checksum
+    pFrameOut[0] = kFrameHeader;        // 0x24
+    pFrameOut[1] = (uint8_t)nFrameLen; // DATA_LEN
+    for (int i = 0; i < nCmdLen; ++i)
+        pFrameOut[2 + i] = pCmd[i];
+    // Checksum covers all bytes except the checksum itself
+    pFrameOut[2 + nCmdLen] = calcChecksum(pFrameOut, nFrameLen - 1);
+    nFrameLenOut = nFrameLen;
+    return SB_OK;
 }
 
-int X2Svbony241Pro::readResponse(char* pszResp, const int nRespLen)
+// ---------------------------------------------------------------------------
+// calcChecksum
+//
+// sum of all bytes in pBuf[0..nLen-1] modulo 0xFF.
+// ---------------------------------------------------------------------------
+uint8_t X2Svbony241Pro::calcChecksum(const uint8_t* pBuf, int nLen) const
+{
+    uint32_t sum = 0;
+    for (int i = 0; i < nLen; ++i)
+        sum += pBuf[i];
+    return static_cast<uint8_t>(sum % 0xFF);
+}
+
+// ---------------------------------------------------------------------------
+// sendFrame
+//
+// Sends a binary command and reads back the response.
+//
+// Command frame: [0x24, DATA_LEN, cmd[0..nCmdLen-1], CS]
+// Response frame: [0x24, DATA_LEN, STATUS, data[0..nResDataLen-1], CS]
+//
+// On return pResDataOut contains nResDataLen payload bytes (bytes 3..3+n-1).
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::sendFrame(const uint8_t* pCmd, int nCmdLen,
+                               int nResDataLen, uint8_t* pResDataOut)
 {
     if (!m_bLinked || m_pSerX == NULL)
         return ERR_COMMNOLINK;
 
-    // -----------------------------------------------------------------------
-    // TODO: Adapt the read logic to the actual SV241 Pro response framing.
-    //
-    // The loop below reads one byte at a time until it sees a newline '\n'
-    // (or '\r'), which is typical for ASCII-framed protocols.  If the device
-    // uses binary framing or a different terminator this section must be
-    // updated accordingly.
-    //
-    // A timeout counter is used to avoid hanging indefinitely if the device
-    // does not respond.
-    // -----------------------------------------------------------------------
+    // Build command frame (max frame size = 6 bytes for 3-byte cmd payload)
+    uint8_t frame[16];
+    int nFrameLen = 0;
+    buildFrame(pCmd, nCmdLen, frame, nFrameLen);
 
-    const int kMaxRetries = 5000;   // rough timeout guard (iterations)
-    int nIdx    = 0;
-    int nRetry  = 0;
-    bool bDone  = false;
+    // Flush stale bytes before writing
+    m_pSerX->purgeTxRx();
 
-    if (pszResp == NULL || nRespLen <= 0)
-        return ERR_BADPARAMETER;
-
-    pszResp[0] = '\0';
-
-    while (!bDone && nRetry < kMaxRetries)
+    // Write command frame
+    unsigned long nWritten = 0;
+    int nErr = m_pSerX->writeFile(frame, (unsigned long)nFrameLen, nWritten);
+    if (nErr != SB_OK)
     {
-        unsigned long nBytesRead = 0;
-        char cByte = 0;
+        if (m_pLogger) m_pLogger->out("X2Svbony241Pro: writeFile error");
+        return nErr;
+    }
+    if ((int)nWritten != nFrameLen)
+    {
+        if (m_pLogger) m_pLogger->out("X2Svbony241Pro: writeFile short write");
+        return ERR_CMDFAILED;
+    }
 
-        int nErr = m_pSerX->readFile(&cByte, 1, nBytesRead);
+    // Post-write sleep: mirrors the INDI driver's tcdrain() + 100 ms sleep
+    // to ensure the ESP32 has fully received the command before we read back.
+    if (m_pSleeper)
+        m_pSleeper->sleep(kPostWriteSleepMs);
+
+    // Read response: header(1) + data_len(1) + status(1) + payload(n) + checksum(1)
+    int nFullResLen = nResDataLen + 4;
+    uint8_t resBuf[32];    // 14 bytes max (cmd 0x08); 32 is safe
+    nErr = readFrame(nFullResLen, resBuf);
+    if (nErr != SB_OK)
+        return nErr;
+
+    // Flush after read to clear any residual bytes
+    m_pSerX->purgeTxRx();
+
+    // Verify response checksum
+    uint8_t csExpected = calcChecksum(resBuf, nFullResLen - 1);
+    if (resBuf[nFullResLen - 1] != csExpected)
+    {
+        if (m_pLogger) m_pLogger->out("X2Svbony241Pro: checksum mismatch in response");
+        return ERR_CMDFAILED;
+    }
+
+    // Check device status byte (response[2] == 0xAA means device rejected the command)
+    if (resBuf[2] == kStatusFailure)
+    {
+        if (m_pLogger) m_pLogger->out("X2Svbony241Pro: device returned failure status (0xAA)");
+        return ERR_CMDFAILED;
+    }
+
+    // Return the payload bytes to the caller (bytes at offsets 3..3+nResDataLen-1)
+    for (int i = 0; i < nResDataLen; ++i)
+        pResDataOut[i] = resBuf[3 + i];
+
+    return SB_OK;
+}
+
+// ---------------------------------------------------------------------------
+// readFrame
+//
+// Reads exactly nExpectedBytes from the serial port.
+// Retries every 1 ms up to kReadTimeoutMs total.
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::readFrame(int nExpectedBytes, uint8_t* pBufOut)
+{
+    int nRead = 0;
+    int nIdle = 0;
+
+    while (nRead < nExpectedBytes && nIdle < kReadTimeoutMs)
+    {
+        unsigned long nGot = 0;
+        int nErr = m_pSerX->readFile(pBufOut + nRead,
+                                     (unsigned long)(nExpectedBytes - nRead),
+                                     nGot);
         if (nErr != SB_OK)
             return nErr;
 
-        if (nBytesRead == 0)
+        if (nGot == 0)
         {
-            ++nRetry;
-            if (m_pSleeper)
-                m_pSleeper->sleep(1);   // 1 ms
-            continue;
-        }
-
-        nRetry = 0;     // reset timeout on successful byte
-
-        if (cByte == '\n' || cByte == '\r')
-        {
-            bDone = true;
+            ++nIdle;
+            if (m_pSleeper) m_pSleeper->sleep(1);
         }
         else
         {
-            if (nIdx < nRespLen - 1)
-                pszResp[nIdx++] = cByte;
+            nRead += (int)nGot;
+            nIdle  = 0;     // reset idle counter on any progress
         }
     }
 
-    pszResp[nIdx] = '\0';
-
-    if (nRetry >= kMaxRetries)
+    if (nRead < nExpectedBytes)
     {
-        if (m_pLogger)
-            m_pLogger->out("X2Svbony241Pro: readResponse — timeout waiting for device");
+        if (m_pLogger) m_pLogger->out("X2Svbony241Pro: read timeout");
         return ERR_COMMTIMEOUT;
     }
 
     return SB_OK;
 }
 
-int X2Svbony241Pro::queryAllCircuitStates()
-{
-    // -----------------------------------------------------------------------
-    // TODO: Issue the appropriate status-query command to the SV241 Pro and
-    //       parse its response to populate m_bCircuitState[].
-    //
-    // Once the device protocol is known this method should:
-    //   1. Send a status/query command, e.g. "STATUS\r\n"
-    //   2. Parse the response to extract the on/off state of each circuit.
-    //   3. Populate m_bCircuitState[0..X2_NUM_CIRCUITS-1] accordingly.
-    //
-    // Example placeholder (protocol unknown):
-    //
-    //   char szResp[kRespBufLen];
-    //   int nErr = sendCommand("STATUS\r\n", szResp, kRespBufLen);
-    //   if (nErr != SB_OK)
-    //       return nErr;
-    //   // ... parse szResp ...
-    //
-    // For now, initialise all circuits to OFF (safe default).
-    // -----------------------------------------------------------------------
+// ===========================================================================
+// Initialization helpers
+// ===========================================================================
 
-    for (int i = 0; i < X2_NUM_CIRCUITS; ++i)
-        m_bCircuitState[i] = false;
+// ---------------------------------------------------------------------------
+// drainBootLog
+//
+// The SV241 Pro's ESP32 resets when the serial port opens (standard
+// Arduino/ESP32 auto-reset via USB-CDC DTR/RTS).  It emits ~10 lines of
+// boot text at 115200 before the firmware accepts binary commands.
+//
+// Strategy: wait 500 ms for the boot to start, then read and discard until
+// we see kBootDrainRetries consecutive quiet reads (no bytes arriving).
+//
+// Note: the INDI driver uses ioctl(TIOCMSET) to explicitly clear RTS and DTR
+// before draining.  SerXInterface does not expose ioctl, so we rely on the
+// USB-CDC chip's built-in auto-reset behavior, which is present on standard
+// ESP32 DevKit hardware.
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::drainBootLog()
+{
+    if (m_pLogger)
+        m_pLogger->out("X2Svbony241Pro: waiting for ESP32 boot log to drain...");
+
+    // Give the ESP32 time to complete its reset and emit the boot log
+    if (m_pSleeper)
+        m_pSleeper->sleep(kBootDrainInitSleepMs);
+
+    uint8_t discard[64];
+    int nQuietRounds = 0;
+    const int kQuietTarget = 3;     // 3 consecutive empty reads → log is done
+
+    for (int i = 0; i < kBootDrainRetries && nQuietRounds < kQuietTarget; ++i)
+    {
+        if (m_pSleeper)
+            m_pSleeper->sleep(kBootDrainSleepMs);
+
+        unsigned long nRead = 0;
+        m_pSerX->readFile(discard, sizeof(discard), nRead);
+
+        if (nRead == 0)
+            ++nQuietRounds;
+        else
+            nQuietRounds = 0;
+    }
+
+    // Final flush of any residual bytes in the kernel buffer
+    m_pSerX->purgeTxRx();
 
     if (m_pLogger)
-        m_pLogger->out("X2Svbony241Pro: queryAllCircuitStates — STUB, all circuits set to OFF");
+        m_pLogger->out("X2Svbony241Pro: boot log drain complete");
 
+    return SB_OK;
+}
+
+// ===========================================================================
+// Device commands — one method per protocol command byte
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// cmdSetPort  (cmd 0x01)
+//
+// Payload: [0x01, portIndex, value]   (3 bytes)
+// Response data: 2 bytes (acknowledged echo / status)
+//
+// portIndex: 0x00-0x04 = DC ports 1-5
+//            0x05-0x06 = USB groups 0-1
+//            0x07      = regulated voltage output
+//            0x08-0x09 = dew heater PWM channels 1-2
+// value:     0x00 = off
+//            0xFF = full on (DC / USB)
+//            0x01-0xFF = PWM raw (dew heaters) or voltage raw (regulated)
+//
+// See PROTOCOL.md §7–10 for per-channel encoding details.
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::cmdSetPort(uint8_t portIndex, uint8_t value)
+{
+    uint8_t cmd[3] = { 0x01, portIndex, value };
+    uint8_t res[2] = { 0 };
+    return sendFrame(cmd, 3, 2, res);
+}
+
+// ---------------------------------------------------------------------------
+// cmdReadPower  (cmd 0x02)
+//
+// Payload: [0x02]  (1 byte)
+// Response data: 4-byte big-endian unsigned integer
+// Decode: raw / 100.0 = power in mW → divide by 1000 for W
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::cmdReadPower(double& powerW)
+{
+    uint8_t cmd[1] = { 0x02 };
+    uint8_t res[4] = { 0 };
+    int nErr = sendFrame(cmd, 1, 4, res);
+    if (nErr == SB_OK)
+        powerW = decodeSensor4(res) / 1000.0;   // mW × 100 → W
+    return nErr;
+}
+
+// ---------------------------------------------------------------------------
+// cmdReadVoltage  (cmd 0x03)
+//
+// Response data: 4-byte big-endian unsigned integer
+// Decode: raw / 100.0 = bus voltage in V
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::cmdReadVoltage(double& voltageV)
+{
+    uint8_t cmd[1] = { 0x03 };
+    uint8_t res[4] = { 0 };
+    int nErr = sendFrame(cmd, 1, 4, res);
+    if (nErr == SB_OK)
+        voltageV = decodeSensor4(res);
+    return nErr;
+}
+
+// ---------------------------------------------------------------------------
+// cmdReadDS18B20Temp  (cmd 0x04)
+//
+// Response data: 4-byte big-endian unsigned integer
+// Decode: (raw/100.0 - 255.5) rounded to 2 d.p. → °C
+// The 255.5 is a firmware-baked offset on the ESP32 side.
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::cmdReadDS18B20Temp(double& tempC)
+{
+    uint8_t cmd[1] = { 0x04 };
+    uint8_t res[4] = { 0 };
+    int nErr = sendFrame(cmd, 1, 4, res);
+    if (nErr == SB_OK)
+        tempC = decodeDS18B20Temp(res);
+    return nErr;
+}
+
+// ---------------------------------------------------------------------------
+// cmdReadSHT40Temp  (cmd 0x05)
+//
+// Response data: 4-byte big-endian unsigned integer
+// Decode: (raw/100.0 - 254.0) rounded to 1 d.p. → °C
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::cmdReadSHT40Temp(double& tempC)
+{
+    uint8_t cmd[1] = { 0x05 };
+    uint8_t res[4] = { 0 };
+    int nErr = sendFrame(cmd, 1, 4, res);
+    if (nErr == SB_OK)
+        tempC = decodeSHT40Temp(res);
+    return nErr;
+}
+
+// ---------------------------------------------------------------------------
+// cmdReadSHT40Humidity  (cmd 0x06)
+//
+// Response data: 4-byte big-endian unsigned integer
+// Decode: (raw/100.0 - 254.0) rounded to 1 d.p. → % RH
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::cmdReadSHT40Humidity(double& humidityPct)
+{
+    uint8_t cmd[1] = { 0x06 };
+    uint8_t res[4] = { 0 };
+    int nErr = sendFrame(cmd, 1, 4, res);
+    if (nErr == SB_OK)
+        humidityPct = decodeSHT40Humidity(res);
+    return nErr;
+}
+
+// ---------------------------------------------------------------------------
+// cmdReadCurrent  (cmd 0x07)
+//
+// Response data: 4-byte big-endian unsigned integer
+// Decode: raw / 100.0 = current in mA → divide by 1000 for A
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::cmdReadCurrent(double& currentA)
+{
+    uint8_t cmd[1] = { 0x07 };
+    uint8_t res[4] = { 0 };
+    int nErr = sendFrame(cmd, 1, 4, res);
+    if (nErr == SB_OK)
+        currentA = decodeSensor4(res) / 1000.0;  // mA × 100 → A
+    return nErr;
+}
+
+// ---------------------------------------------------------------------------
+// cmdGetState  (cmd 0x08)
+//
+// Payload: [0x08]  (1 byte)
+// Response data: 10 bytes
+//
+// Byte layout of the 10-byte payload (see PROTOCOL.md §12):
+//   [0] GPIO1  DC port 1 state    (0 = off, non-zero = on)
+//   [1] GPIO2  DC port 2 state
+//   [2] GPIO3  DC port 3 state
+//   [3] GPIO4  DC port 4 state
+//   [4] GPIO5  DC port 5 state
+//   [5] GPIO6  USB group 0 state
+//   [6] GPIO7  USB group 1 state
+//   [7] pwmA   Regulated voltage raw (0–255, V = byte×15.3/255)
+//   [8] pwmB   Dew heater 1 raw     (0–255, duty% = byte/255×100)
+//   [9] pwmC   Dew heater 2 raw     (0–255, duty% = byte/255×100)
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::cmdGetState(uint8_t* pState10Out)
+{
+    uint8_t cmd[1] = { 0x08 };
+    return sendFrame(cmd, 1, 10, pState10Out);
+}
+
+// ---------------------------------------------------------------------------
+// cmdPowerCycle
+//
+// Two-step sequence (see PROTOCOL.md §15):
+//   Step 1: send [0xFF, 0xFF] → all outputs off
+//   Wait 1000 ms
+//   Step 2: send [0xFE, 0xFE] → all outputs back on
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::cmdPowerCycle()
+{
+    uint8_t res[2] = { 0 };
+
+    // Step 1 — all off
+    uint8_t cmdOff[2] = { 0xFF, 0xFF };
+    int nErr = sendFrame(cmdOff, 2, 2, res);
+    if (nErr != SB_OK)
+        return nErr;
+
+    if (m_pSleeper)
+        m_pSleeper->sleep(kPowerCycleSleepMs);
+
+    // Step 2 — all back on
+    uint8_t cmdOn[2] = { 0xFE, 0xFE };
+    return sendFrame(cmdOn, 2, 2, res);
+}
+
+// ===========================================================================
+// Sensor decode helpers
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// decodeSensor4
+//
+// Interprets pData4 as a 4-byte big-endian unsigned integer and divides by
+// 100.0.  This is the base decode for all sensor commands (0x02–0x07).
+// ---------------------------------------------------------------------------
+double X2Svbony241Pro::decodeSensor4(const uint8_t* pData4)
+{
+    uint32_t raw = (static_cast<uint32_t>(pData4[0]) << 24)
+                 | (static_cast<uint32_t>(pData4[1]) << 16)
+                 | (static_cast<uint32_t>(pData4[2]) <<  8)
+                 |  static_cast<uint32_t>(pData4[3]);
+    return static_cast<double>(raw) / 100.0;
+}
+
+// ---------------------------------------------------------------------------
+// decodeDS18B20Temp  (cmd 0x04)
+//
+// scaled = raw / 100.0
+// temp   = scaled - 255.5       (firmware-baked offset)
+// Result rounded to 2 decimal places.
+// ---------------------------------------------------------------------------
+double X2Svbony241Pro::decodeDS18B20Temp(const uint8_t* pData4)
+{
+    double scaled = decodeSensor4(pData4);
+    double tempC  = scaled - 255.5;
+    return floor(tempC * 100.0 + 0.5) / 100.0;
+}
+
+// ---------------------------------------------------------------------------
+// decodeSHT40Temp  (cmd 0x05)
+//
+// scaled = raw / 100.0
+// temp   = scaled - 254.0       (firmware-baked offset)
+// Result rounded to 1 decimal place.
+// ---------------------------------------------------------------------------
+double X2Svbony241Pro::decodeSHT40Temp(const uint8_t* pData4)
+{
+    double scaled = decodeSensor4(pData4);
+    double tempC  = scaled - 254.0;
+    return floor(tempC * 10.0 + 0.5) / 10.0;
+}
+
+// ---------------------------------------------------------------------------
+// decodeSHT40Humidity  (cmd 0x06)
+//
+// Same formula as SHT40 temperature decode; units are % RH.
+// ---------------------------------------------------------------------------
+double X2Svbony241Pro::decodeSHT40Humidity(const uint8_t* pData4)
+{
+    double scaled    = decodeSensor4(pData4);
+    double humidity  = scaled - 254.0;
+    return floor(humidity * 10.0 + 0.5) / 10.0;
+}
+
+// ===========================================================================
+// Circuit ↔ device port mapping
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// portIndexForCircuit
+//
+// Returns the device port_index byte (for cmd 0x01) for X2 circuit nCircuit.
+// ---------------------------------------------------------------------------
+uint8_t X2Svbony241Pro::portIndexForCircuit(int nCircuit)
+{
+    if (nCircuit < 0 || nCircuit >= X2_NUM_CIRCUITS)
+        return 0xFF;    // invalid — caller checks return code before this
+    return kPortIndex[nCircuit];
+}
+
+// ---------------------------------------------------------------------------
+// onValueForCircuit
+//
+// Returns the raw value byte that represents "ON" for the given X2 circuit.
+//
+// DC ports / USB:  0xFF (fully on, digital)
+// Dew heaters:     encoded duty cycle byte (0x01–0xFF) from m_nDewDutyPct[]
+// Regulated output: encoded voltage byte (0x01–0xFF) from m_dRegulatedVoltageV
+//
+// For analogue channels we clamp to at least 0x01 so that "on" never sends
+// the same byte as "off" (0x00) when the stored level is at its minimum.
+// ---------------------------------------------------------------------------
+uint8_t X2Svbony241Pro::onValueForCircuit(int nCircuit) const
+{
+    if (nCircuit == 4 || nCircuit == 5)     // Dew Heater 1 or 2
+    {
+        int   dutyIdx = nCircuit - 4;       // 0 or 1
+        double duty   = static_cast<double>(m_nDewDutyPct[dutyIdx]);
+        uint8_t raw   = static_cast<uint8_t>(floor(255.0 * duty / 100.0 + 0.5));
+        return raw ? raw : 0x01;
+    }
+
+    if (nCircuit == 7)                      // Regulated voltage output
+    {
+        double v = m_dRegulatedVoltageV;
+        if (v <= 0.0) v = kDefaultRegulatedVoltageV;
+        if (v > 15.3) v = 15.3;
+        uint8_t raw = static_cast<uint8_t>(floor(v / 15.3 * 255.0 + 0.5));
+        return raw ? raw : 0x01;
+    }
+
+    // DC ports (circuits 0-3) and USB hub (circuit 6): fully on
+    return 0xFF;
+}
+
+// ---------------------------------------------------------------------------
+// parseStateResponse
+//
+// Decodes the 10-byte payload from cmdGetState() and updates:
+//   m_bCircuitState[]         (cached on/off for X2 interface)
+//   m_nDewDutyPct[]           (current dew heater duty %, if channel is on)
+//   m_dRegulatedVoltageV      (current regulated voltage, if channel is on)
+//
+// Payload byte layout — see PROTOCOL.md §12 and cmdGetState() above.
+// ---------------------------------------------------------------------------
+void X2Svbony241Pro::parseStateResponse(const uint8_t* pState10)
+{
+    // DC ports 1-4 (circuits 0-3).  Device has a 5th DC port (pState10[4])
+    // which we do not expose in the X2 circuit map.
+    m_bCircuitState[0] = (pState10[0] != 0);
+    m_bCircuitState[1] = (pState10[1] != 0);
+    m_bCircuitState[2] = (pState10[2] != 0);
+    m_bCircuitState[3] = (pState10[3] != 0);
+
+    // USB group 0 → circuit 6 (group 1 at pState10[6] is not exposed)
+    m_bCircuitState[6] = (pState10[5] != 0);
+
+    // Regulated voltage output → circuit 7
+    // Raw byte (pState10[7]) encodes voltage as: V = byte × 15.3 / 255.0
+    double regV = static_cast<double>(pState10[7]) * 15.3 / 255.0;
+    m_bCircuitState[7] = (regV > 0.0);
+    if (m_bCircuitState[7])
+        m_dRegulatedVoltageV = regV;    // keep stored level in sync with device
+
+    // Dew heater 1 → circuit 4;  raw byte encodes duty%: pct = byte/255.0×100
+    int duty0 = static_cast<int>(floor(static_cast<double>(pState10[8]) / 255.0 * 100.0 + 0.5));
+    m_bCircuitState[4] = (duty0 > 0);
+    if (m_bCircuitState[4])
+        m_nDewDutyPct[0] = duty0;
+
+    // Dew heater 2 → circuit 5
+    int duty1 = static_cast<int>(floor(static_cast<double>(pState10[9]) / 255.0 * 100.0 + 0.5));
+    m_bCircuitState[5] = (duty1 > 0);
+    if (m_bCircuitState[5])
+        m_nDewDutyPct[1] = duty1;
+}
+
+// ---------------------------------------------------------------------------
+// queryAllCircuitStates
+//
+// Issues cmd 0x08 and refreshes m_bCircuitState[] from the response.
+// Called on connect and may be called by the TheSkyX polling loop.
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::queryAllCircuitStates()
+{
+    uint8_t state10[10] = {0};
+    int nErr = cmdGetState(state10);
+    if (nErr != SB_OK)
+        return nErr;
+
+    parseStateResponse(state10);
     return SB_OK;
 }

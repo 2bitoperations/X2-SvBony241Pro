@@ -9,18 +9,29 @@
 #include "../X2-Examples/licensedinterfaces/mutexinterface.h"
 #include "../X2-Examples/licensedinterfaces/tickcountinterface.h"
 
+#include <stdint.h>
+
 /*
  * SVBony SV241 Pro USB Power Hub — X2 Power Control Driver
  *
- * Circuit layout:
+ * X2 circuit layout:
  *   Circuit 0 : DC Port 1     (12V switchable)
  *   Circuit 1 : DC Port 2     (12V switchable)
  *   Circuit 2 : DC Port 3     (12V switchable)
  *   Circuit 3 : DC Port 4     (12V switchable)
- *   Circuit 4 : Dew Heater 1  (PWM 0-100%)
- *   Circuit 5 : Dew Heater 2  (PWM 0-100%)
- *   Circuit 6 : USB Hub Power (switchable)
- *   Circuit 7 : Adjustable Output
+ *   Circuit 4 : Dew Heater 1  (PWM, default 50% duty)
+ *   Circuit 5 : Dew Heater 2  (PWM, default 50% duty)
+ *   Circuit 6 : USB Hub Power (group 0: USB-C, USB1, USB2)
+ *   Circuit 7 : Adjustable Output (regulated voltage, default 12 V)
+ *
+ * Device port_index mapping for cmd 0x01 (see PROTOCOL.md §7–10):
+ *   0x00 : DC 1    0x01 : DC 2    0x02 : DC 3    0x03 : DC 4
+ *   0x04 : DC 5    (device has 5 DC ports; we expose 4 in X2)
+ *   0x05 : USB group 0 (USB-C, USB1, USB2)
+ *   0x06 : USB group 1 (USB3, USB4, USB5)  (not exposed in X2)
+ *   0x07 : Regulated voltage output
+ *   0x08 : Dew heater PWM 1
+ *   0x09 : Dew heater PWM 2
  */
 
 #define X2_NUM_CIRCUITS 8
@@ -44,52 +55,141 @@ public:
     // -----------------------------------------------------------------------
     // DriverRootInterface
     // -----------------------------------------------------------------------
-    virtual DeviceType              deviceType()                    { return PowerControlBox; }
-    virtual int                     queryAbstraction(const char* pszName, void** ppVal);
+    virtual DeviceType  deviceType()                                        { return PowerControlBox; }
+    virtual int         queryAbstraction(const char* pszName, void** ppVal);
 
     // -----------------------------------------------------------------------
     // DriverInfoInterface
     // -----------------------------------------------------------------------
-    virtual void                    driverInfoDetailedInfo(BasicStringInterface& str) const;
-    virtual double                  driverInfoVersion() const;
+    virtual void        driverInfoDetailedInfo(BasicStringInterface& str) const;
+    virtual double      driverInfoVersion() const;
 
     // -----------------------------------------------------------------------
     // DeviceInfoInterface
     // -----------------------------------------------------------------------
-    virtual void                    deviceInfoNameShort(BasicStringInterface& str) const;
-    virtual void                    deviceInfoNameLong(BasicStringInterface& str) const;
-    virtual void                    deviceInfoDetailedDescription(BasicStringInterface& str) const;
-    virtual void                    deviceInfoFirmwareVersion(BasicStringInterface& str);
-    virtual void                    deviceInfoModel(BasicStringInterface& str);
+    virtual void        deviceInfoNameShort(BasicStringInterface& str) const;
+    virtual void        deviceInfoNameLong(BasicStringInterface& str) const;
+    virtual void        deviceInfoDetailedDescription(BasicStringInterface& str) const;
+    virtual void        deviceInfoFirmwareVersion(BasicStringInterface& str);
+    virtual void        deviceInfoModel(BasicStringInterface& str);
 
     // -----------------------------------------------------------------------
     // LinkInterface
     // -----------------------------------------------------------------------
-    virtual int                     establishLink();
-    virtual int                     terminateLink();
-    virtual bool                    isLinked() const;
+    virtual int         establishLink();
+    virtual int         terminateLink();
+    virtual bool        isLinked() const;
 
     // -----------------------------------------------------------------------
     // PowerControlDriverInterface
     // -----------------------------------------------------------------------
-    virtual int                     numberOfCircuits(int& nNumber);
-    virtual int                     circuitName(const int& nIndex, BasicStringInterface& str);
-    virtual int                     circuitState(const int& nIndex, bool& bOn);
-    virtual int                     setCircuitState(const int& nIndex, const bool& bOn);
+    virtual int         numberOfCircuits(int& nNumber);
+    virtual int         circuitName(const int& nIndex, BasicStringInterface& str);
+    virtual int         circuitState(const int& nIndex, bool& bOn);
+    virtual int         setCircuitState(const int& nIndex, const bool& bOn);
 
 private:
-    // Send a command string to the device and read back a response line.
-    // Returns SB_OK on success, non-zero on error.
-    int sendCommand(const char* pszCmd, char* pszResp, const int nRespLen);
+    // -----------------------------------------------------------------------
+    // Binary frame I/O  (see PROTOCOL.md §3–4)
+    // -----------------------------------------------------------------------
 
-    // Read a single line of response from the device into pszResp.
-    int readResponse(char* pszResp, const int nRespLen);
+    // Build a command frame: [0x24, DATA_LEN, cmd[0..n-1], CHECKSUM].
+    // pFrameOut must be at least nCmdLen+3 bytes.  Returns total frame length.
+    int         buildFrame(const uint8_t* pCmd, int nCmdLen,
+                           uint8_t* pFrameOut, int& nFrameLenOut) const;
 
-    // Query the device for the current state of all circuits and
-    // populate m_bCircuitState[].
-    int queryAllCircuitStates();
+    // Checksum = sum of pBuf[0..nLen-1] mod 0xFF.
+    uint8_t     calcChecksum(const uint8_t* pBuf, int nLen) const;
 
-    // TSX-provided interfaces (not owned by this object — do not delete)
+    // Send nCmdLen-byte command payload and receive nResDataLen data bytes.
+    // On success pResDataOut receives the payload (no header/status/checksum).
+    // Returns SB_OK | ERR_COMMNOLINK | ERR_COMMTIMEOUT | ERR_CMDFAILED.
+    int         sendFrame(const uint8_t* pCmd, int nCmdLen,
+                          int nResDataLen, uint8_t* pResDataOut);
+
+    // Read exactly nExpectedBytes from the port, with 500 ms timeout.
+    int         readFrame(int nExpectedBytes, uint8_t* pBufOut);
+
+    // -----------------------------------------------------------------------
+    // Initialisation helpers
+    // -----------------------------------------------------------------------
+
+    // Read and discard the ESP32 boot log that arrives after port open.
+    // Returns SB_OK when the port goes quiet (non-fatal if not fully drained).
+    int         drainBootLog();
+
+    // -----------------------------------------------------------------------
+    // Device commands — one per protocol command byte (see PROTOCOL.md §5)
+    // -----------------------------------------------------------------------
+
+    // 0x01 — Set any output channel.
+    //         portIndex: device port_index byte (0x00–0x09)
+    //         value:     0x00=off, 0xFF=on (DC/USB), PWM raw byte, or voltage raw byte
+    int         cmdSetPort(uint8_t portIndex, uint8_t value);
+
+    // 0x02 — Read INA219 total input power; result in watts.
+    int         cmdReadPower(double& powerW);
+
+    // 0x03 — Read INA219 bus voltage; result in volts.
+    int         cmdReadVoltage(double& voltageV);
+
+    // 0x04 — Read DS18B20 lens temperature; result in °C.
+    int         cmdReadDS18B20Temp(double& tempC);
+
+    // 0x05 — Read SHT40 ambient temperature; result in °C.
+    int         cmdReadSHT40Temp(double& tempC);
+
+    // 0x06 — Read SHT40 relative humidity; result in % RH.
+    int         cmdReadSHT40Humidity(double& humidityPct);
+
+    // 0x07 — Read INA219 bus current; result in amps.
+    int         cmdReadCurrent(double& currentA);
+
+    // 0x08 — Read full device state.
+    //         pState10Out receives 10 raw bytes: GPIO1-7, regulated, PWM1, PWM2.
+    //         Caller must supply at least 10 bytes.
+    int         cmdGetState(uint8_t* pState10Out);
+
+    // 0xFF/0xFF → sleep 1 s → 0xFE/0xFE — Power-cycle all outputs.
+    int         cmdPowerCycle();
+
+    // -----------------------------------------------------------------------
+    // Sensor decode helpers — pure functions, no side-effects
+    // -----------------------------------------------------------------------
+
+    // Decode 4-byte big-endian payload and divide by 100 (base conversion).
+    static double decodeSensor4(const uint8_t* pData4);
+
+    // DS18B20: (raw/100 - 255.5), rounded to 2 decimal places → °C
+    static double decodeDS18B20Temp(const uint8_t* pData4);
+
+    // SHT40 temp: (raw/100 - 254.0), rounded to 1 decimal place → °C
+    static double decodeSHT40Temp(const uint8_t* pData4);
+
+    // SHT40 humidity: (raw/100 - 254.0), rounded to 1 decimal place → % RH
+    static double decodeSHT40Humidity(const uint8_t* pData4);
+
+    // -----------------------------------------------------------------------
+    // Circuit ↔ device port mapping helpers
+    // -----------------------------------------------------------------------
+
+    // Return the device port_index byte for X2 circuit nCircuit.
+    static uint8_t  portIndexForCircuit(int nCircuit);
+
+    // Return the raw ON value for cmd 0x01 for X2 circuit nCircuit.
+    // Reads m_nDewDutyPct[] and m_dRegulatedVoltageV for analogue channels.
+    uint8_t         onValueForCircuit(int nCircuit) const;
+
+    // Populate m_bCircuitState[] (and cached analogue levels) from a 10-byte
+    // state response as returned by cmdGetState().
+    void            parseStateResponse(const uint8_t* pState10);
+
+    // Issue cmdGetState() and update all cached state.
+    int             queryAllCircuitStates();
+
+    // -----------------------------------------------------------------------
+    // TSX-provided interfaces (not owned by this object — do NOT delete)
+    // -----------------------------------------------------------------------
     SerXInterface*                      m_pSerX;
     TheSkyXFacadeForDriversInterface*   m_pTheSkyX;
     SleeperInterface*                   m_pSleeper;
@@ -98,9 +198,21 @@ private:
     MutexInterface*                     m_pIOMutex;
     TickCountInterface*                 m_pTickCount;
 
-    int                                 m_nInstanceIndex;
-    bool                                m_bLinked;
+    int     m_nInstanceIndex;
+    bool    m_bLinked;
 
-    // Cached on/off state for each circuit (indexed 0..X2_NUM_CIRCUITS-1)
-    bool                                m_bCircuitState[X2_NUM_CIRCUITS];
+    // Cached on/off state for each X2 circuit
+    bool    m_bCircuitState[X2_NUM_CIRCUITS];
+
+    // Cached sensor readings (refreshed by queryAllCircuitStates)
+    double  m_dPowerW;
+    double  m_dVoltageV;
+    double  m_dCurrentA;
+    double  m_dDS18B20TempC;
+    double  m_dSHT40TempC;
+    double  m_dSHT40HumidityPct;
+
+    // Persisted analogue output levels — used when toggling the channel ON
+    int     m_nDewDutyPct[2];      // Circuits 4-5, range 0–100 %
+    double  m_dRegulatedVoltageV;  // Circuit 7, range 0.0–15.3 V
 };
