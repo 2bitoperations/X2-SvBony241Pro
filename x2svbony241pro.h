@@ -11,6 +11,22 @@
 
 #include <stdint.h>
 
+// ---------------------------------------------------------------------------
+// Dew-heater operating mode (per heater)
+// ---------------------------------------------------------------------------
+enum DewHeaterMode
+{
+    DEW_MODE_MANUAL = 0,    // Fixed duty cycle (m_nDewFixedDutyPct[])
+    DEW_MODE_AUTO   = 1     // Automatic: duty driven by dew-point algorithm
+};
+
+// What to do when the environmental sensor read fails in DEW_MODE_AUTO
+enum DewFallback
+{
+    DEW_FALLBACK_OFF = 0,   // Turn the heater off
+    DEW_FALLBACK_ON  = 1    // Run at the stored fixed duty cycle
+};
+
 /*
  * SVBony SV241 Pro USB Power Hub — X2 Power Control Driver
  *
@@ -177,7 +193,7 @@ private:
     static uint8_t  portIndexForCircuit(int nCircuit);
 
     // Return the raw ON value for cmd 0x01 for X2 circuit nCircuit.
-    // Reads m_nDewDutyPct[] and m_dRegulatedVoltageV for analogue channels.
+    // Reads m_nDewFixedDutyPct[] and m_dRegulatedVoltageV for analogue channels.
     uint8_t         onValueForCircuit(int nCircuit) const;
 
     // Populate m_bCircuitState[] (and cached analogue levels) from a 10-byte
@@ -186,6 +202,32 @@ private:
 
     // Issue cmdGetState() and update all cached state.
     int             queryAllCircuitStates();
+
+    // -----------------------------------------------------------------------
+    // Auto dew-point control  (circuits 4 and 5)
+    // -----------------------------------------------------------------------
+
+    // Compute dew point (°C) from ambient temperature and relative humidity.
+    // Uses the Magnus formula.  Pure function, no side-effects.
+    static double   calcDewPoint(double ambientTempC, double humidityPct);
+
+    // Return the auto-algorithm duty cycle % (0–100) for heater heaterIdx
+    // (0 = circuit 4, 1 = circuit 5).  Returns the fallback value if
+    // m_bSensorValid is false.  Does not write to device.
+    int             calcAutoDutyPct(int heaterIdx) const;
+
+    // Read SHT40 sensors, recalculate dew point, and push the resulting PWM
+    // value to any heater in DEW_MODE_AUTO that is currently on.
+    // Rate-limited to once per kDewUpdateIntervalMs via m_nLastDewUpdateTick.
+    // Never throws; sensor failures apply the configured fallback.
+    int             updateDewControl();
+
+    // Persist dew-heater configuration to the TheSkyX ini store.
+    void            saveDewConfig();
+
+    // Restore dew-heater configuration from the TheSkyX ini store.
+    // Called on establishLink(); applies safe defaults if keys are absent.
+    void            loadDewConfig();
 
     // -----------------------------------------------------------------------
     // TSX-provided interfaces (not owned by this object — do NOT delete)
@@ -204,15 +246,28 @@ private:
     // Cached on/off state for each X2 circuit
     bool    m_bCircuitState[X2_NUM_CIRCUITS];
 
-    // Cached sensor readings (refreshed by queryAllCircuitStates)
+    // Cached INA219 sensor readings
     double  m_dPowerW;
     double  m_dVoltageV;
     double  m_dCurrentA;
-    double  m_dDS18B20TempC;
-    double  m_dSHT40TempC;
-    double  m_dSHT40HumidityPct;
 
     // Persisted analogue output levels — used when toggling the channel ON
-    int     m_nDewDutyPct[2];      // Circuits 4-5, range 0–100 %
+    int     m_nDewFixedDutyPct[2]; // Circuits 4-5, range 0–100 % (MANUAL level & FALLBACK_ON level)
     double  m_dRegulatedVoltageV;  // Circuit 7, range 0.0–15.3 V
+
+    // -----------------------------------------------------------------------
+    // Dew-heater auto-control state (per heater: [0]=circuit4, [1]=circuit5)
+    // -----------------------------------------------------------------------
+    DewHeaterMode   m_eDewMode[2];          // MANUAL or AUTO
+    int             m_nDewAggressiveness[2]; // 1 (gentle) – 10 (aggressive)
+    DewFallback     m_eDewFallback[2];       // what to do when sensor fails
+
+    // Environmental readings refreshed by updateDewControl()
+    double          m_dAmbientTempC;
+    double          m_dAmbientHumidityPct;
+    double          m_dDewPointC;
+    bool            m_bSensorValid;          // false after any sensor read failure
+
+    // TickCountInterface timestamp of last auto-dew sensor update
+    unsigned long   m_nLastDewUpdateTick;
 };

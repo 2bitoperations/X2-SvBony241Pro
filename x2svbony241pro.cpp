@@ -51,6 +51,15 @@ static const int     kPowerCycleSleepMs     = 1000;
 static const int     kDefaultDewDutyPct         = 50;    // 50 % PWM duty cycle
 static const double  kDefaultRegulatedVoltageV  = 12.0;  // 12 V
 
+// Auto dew-point control
+static const int           kDefaultDewAggressiveness  = 5;           // mid-range
+static const DewHeaterMode kDefaultDewMode             = DEW_MODE_MANUAL;
+static const DewFallback   kDefaultDewFallback         = DEW_FALLBACK_ON;
+static const unsigned long kDewUpdateIntervalMs        = 30000;       // 30 s between sensor reads
+
+// Ini section key for persisted dew settings
+static const char* kIniSection = "SV241Pro";
+
 // ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
@@ -77,18 +86,25 @@ X2Svbony241Pro::X2Svbony241Pro(
     , m_dPowerW             (0.0)
     , m_dVoltageV           (0.0)
     , m_dCurrentA           (0.0)
-    , m_dDS18B20TempC       (0.0)
-    , m_dSHT40TempC         (0.0)
-    , m_dSHT40HumidityPct   (0.0)
     , m_dRegulatedVoltageV  (kDefaultRegulatedVoltageV)
+    , m_dAmbientTempC       (0.0)
+    , m_dAmbientHumidityPct (0.0)
+    , m_dDewPointC          (0.0)
+    , m_bSensorValid        (false)
+    , m_nLastDewUpdateTick  (0)
 {
     (void)pszDisplayName;   // display name is managed by TheSkyX
 
     for (int i = 0; i < X2_NUM_CIRCUITS; ++i)
         m_bCircuitState[i] = false;
 
-    m_nDewDutyPct[0] = kDefaultDewDutyPct;
-    m_nDewDutyPct[1] = kDefaultDewDutyPct;
+    for (int i = 0; i < 2; ++i)
+    {
+        m_nDewFixedDutyPct[i]   = kDefaultDewDutyPct;
+        m_eDewMode[i]           = kDefaultDewMode;
+        m_nDewAggressiveness[i] = kDefaultDewAggressiveness;
+        m_eDewFallback[i]       = kDefaultDewFallback;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +185,9 @@ int X2Svbony241Pro::establishLink()
 
     m_bLinked = true;
 
+    // Restore persisted dew-heater configuration before touching the device.
+    loadDewConfig();
+
     // Drain the ESP32 boot log.  The device resets when the serial port opens;
     // we must consume the boot text before sending binary commands.
     // Non-fatal: if drain times out we attempt the handshake anyway.
@@ -197,6 +216,8 @@ int X2Svbony241Pro::establishLink()
 
 int X2Svbony241Pro::terminateLink()
 {
+    saveDewConfig();
+
     if (m_pSerX != NULL)
         m_pSerX->close();
 
@@ -238,6 +259,20 @@ int X2Svbony241Pro::circuitState(const int& nIndex, bool& bOn)
     if (nIndex < 0 || nIndex >= X2_NUM_CIRCUITS)
         return ERR_DATAOUT_OF_RANGE;
 
+    // For dew heater circuits in auto mode, check whether it is time to run
+    // a sensor read and PWM update.  TheSkyX polls circuitState() periodically,
+    // so this is the natural place to drive the control loop.
+    if (nIndex == 4 || nIndex == 5)
+    {
+        int heaterIdx = nIndex - 4;
+        if (m_eDewMode[heaterIdx] == DEW_MODE_AUTO && m_bCircuitState[nIndex])
+        {
+            unsigned long now = m_pTickCount ? m_pTickCount->elapsed() : 0;
+            if (now == 0 || (now - m_nLastDewUpdateTick) >= kDewUpdateIntervalMs)
+                updateDewControl();
+        }
+    }
+
     bOn = m_bCircuitState[nIndex];
     return SB_OK;
 }
@@ -250,14 +285,28 @@ int X2Svbony241Pro::setCircuitState(const int& nIndex, const bool& bOn)
         return ERR_DATAOUT_OF_RANGE;
 
     uint8_t portIdx = portIndexForCircuit(nIndex);
-    uint8_t value   = bOn ? onValueForCircuit(nIndex) : static_cast<uint8_t>(0x00);
+    int     nErr    = SB_OK;
 
-    int nErr = cmdSetPort(portIdx, value);
-    if (nErr != SB_OK)
-        return nErr;
+    if ((nIndex == 4 || nIndex == 5) && m_eDewMode[nIndex - 4] == DEW_MODE_AUTO && bOn)
+    {
+        // Turning an auto-mode heater ON: run the control algorithm immediately
+        // rather than waiting for the next poll cycle.  This gives instant
+        // feedback rather than a potentially 30-second delay.
+        m_bCircuitState[nIndex] = true;     // mark on so updateDewControl sees it
+        m_nLastDewUpdateTick    = 0;        // force an immediate sensor read
+        nErr = updateDewControl();
+        // updateDewControl() sends the PWM command and may flip the circuit
+        // back to false if the algorithm/fallback yields 0 %.
+    }
+    else
+    {
+        uint8_t value = bOn ? onValueForCircuit(nIndex) : static_cast<uint8_t>(0x00);
+        nErr = cmdSetPort(portIdx, value);
+        if (nErr == SB_OK)
+            m_bCircuitState[nIndex] = bOn;
+    }
 
-    m_bCircuitState[nIndex] = bOn;
-    return SB_OK;
+    return nErr;
 }
 
 // ===========================================================================
@@ -726,7 +775,7 @@ uint8_t X2Svbony241Pro::portIndexForCircuit(int nCircuit)
 // Returns the raw value byte that represents "ON" for the given X2 circuit.
 //
 // DC ports / USB:  0xFF (fully on, digital)
-// Dew heaters:     encoded duty cycle byte (0x01–0xFF) from m_nDewDutyPct[]
+// Dew heaters:     encoded duty cycle byte (0x01–0xFF) from m_nDewFixedDutyPct[]
 // Regulated output: encoded voltage byte (0x01–0xFF) from m_dRegulatedVoltageV
 //
 // For analogue channels we clamp to at least 0x01 so that "on" never sends
@@ -737,7 +786,7 @@ uint8_t X2Svbony241Pro::onValueForCircuit(int nCircuit) const
     if (nCircuit == 4 || nCircuit == 5)     // Dew Heater 1 or 2
     {
         int   dutyIdx = nCircuit - 4;       // 0 or 1
-        double duty   = static_cast<double>(m_nDewDutyPct[dutyIdx]);
+        double duty   = static_cast<double>(m_nDewFixedDutyPct[dutyIdx]);
         uint8_t raw   = static_cast<uint8_t>(floor(255.0 * duty / 100.0 + 0.5));
         return raw ? raw : 0x01;
     }
@@ -760,7 +809,7 @@ uint8_t X2Svbony241Pro::onValueForCircuit(int nCircuit) const
 //
 // Decodes the 10-byte payload from cmdGetState() and updates:
 //   m_bCircuitState[]         (cached on/off for X2 interface)
-//   m_nDewDutyPct[]           (current dew heater duty %, if channel is on)
+//   m_nDewFixedDutyPct[]           (current dew heater duty %, if channel is on)
 //   m_dRegulatedVoltageV      (current regulated voltage, if channel is on)
 //
 // Payload byte layout — see PROTOCOL.md §12 and cmdGetState() above.
@@ -784,17 +833,18 @@ void X2Svbony241Pro::parseStateResponse(const uint8_t* pState10)
     if (m_bCircuitState[7])
         m_dRegulatedVoltageV = regV;    // keep stored level in sync with device
 
-    // Dew heater 1 → circuit 4;  raw byte encodes duty%: pct = byte/255.0×100
+    // Dew heater 1 → circuit 4;  raw byte encodes duty%: pct = byte/255×100
     int duty0 = static_cast<int>(floor(static_cast<double>(pState10[8]) / 255.0 * 100.0 + 0.5));
     m_bCircuitState[4] = (duty0 > 0);
-    if (m_bCircuitState[4])
-        m_nDewDutyPct[0] = duty0;
+    // Only back-sync the fixed level when in manual mode; auto mode owns the duty value.
+    if (m_bCircuitState[4] && m_eDewMode[0] == DEW_MODE_MANUAL)
+        m_nDewFixedDutyPct[0] = duty0;
 
     // Dew heater 2 → circuit 5
     int duty1 = static_cast<int>(floor(static_cast<double>(pState10[9]) / 255.0 * 100.0 + 0.5));
     m_bCircuitState[5] = (duty1 > 0);
-    if (m_bCircuitState[5])
-        m_nDewDutyPct[1] = duty1;
+    if (m_bCircuitState[5] && m_eDewMode[1] == DEW_MODE_MANUAL)
+        m_nDewFixedDutyPct[1] = duty1;
 }
 
 // ---------------------------------------------------------------------------
@@ -812,4 +862,272 @@ int X2Svbony241Pro::queryAllCircuitStates()
 
     parseStateResponse(state10);
     return SB_OK;
+}
+
+// ===========================================================================
+// Auto dew-point control
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// calcDewPoint
+//
+// Magnus formula for dew point temperature (°C).
+//
+//   γ  = ln(RH/100) + a·T / (b + T)
+//   Td = b·γ / (a − γ)
+//
+// Constants: a = 17.625, b = 243.04 °C  (August-Roche-Magnus approximation)
+// Valid range: −40 °C to +60 °C, 1–100 % RH.  Returns a reasonable value
+// outside that range but accuracy degrades.
+// ---------------------------------------------------------------------------
+double X2Svbony241Pro::calcDewPoint(double ambientTempC, double humidityPct)
+{
+    // Guard against domain errors in log(); clamp to a physically valid range.
+    if (humidityPct <= 0.0)  humidityPct = 0.1;
+    if (humidityPct > 100.0) humidityPct = 100.0;
+
+    const double a = 17.625;
+    const double b = 243.04;    // °C
+
+    double gamma  = log(humidityPct / 100.0) + a * ambientTempC / (b + ambientTempC);
+    return b * gamma / (a - gamma);
+}
+
+// ---------------------------------------------------------------------------
+// calcAutoDutyPct
+//
+// Returns the duty cycle % (0–100) that the auto algorithm prescribes for
+// heater heaterIdx (0 or 1).
+//
+// Algorithm
+// ---------
+// Dew-point depression (DPD) = ambientTemp − dewPoint.
+// A larger DPD means the air is drier / farther from condensation, so less
+// heating is needed.
+//
+// The "response window" W (°C) is the DPD range over which the heater ramps
+// from 100 % down to 0 %:
+//
+//   W = (11 − aggressiveness) × 2
+//
+// Aggressiveness 10 → W = 2 °C  (heater hits 0 % at DPD ≥ 2 °C — aggressive)
+// Aggressiveness  5 → W = 12 °C (mid-range)
+// Aggressiveness  1 → W = 20 °C (gentle; only full-off at DPD ≥ 20 °C)
+//
+// duty % = clamp(100 × (1 − DPD / W), 0, 100)
+//
+// If m_bSensorValid is false the configured fallback is applied instead.
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::calcAutoDutyPct(int heaterIdx) const
+{
+    if (!m_bSensorValid)
+    {
+        if (m_eDewFallback[heaterIdx] == DEW_FALLBACK_ON)
+            return m_nDewFixedDutyPct[heaterIdx];
+        return 0;
+    }
+
+    double dpd    = m_dAmbientTempC - m_dDewPointC;
+    if (dpd < 0.0) dpd = 0.0;
+
+    int    agg    = m_nDewAggressiveness[heaterIdx];
+    if (agg < 1)  agg = 1;
+    if (agg > 10) agg = 10;
+
+    double window = static_cast<double>(11 - agg) * 2.0;  // 2–20 °C
+
+    int duty;
+    if (dpd <= 0.0)
+        duty = 100;
+    else if (dpd >= window)
+        duty = 0;
+    else
+        duty = static_cast<int>(floor(100.0 * (1.0 - dpd / window) + 0.5));
+
+    return duty;
+}
+
+// ---------------------------------------------------------------------------
+// updateDewControl
+//
+// 1. Reads SHT40 temperature and humidity.
+// 2. Calculates the dew point.
+// 3. For each heater in DEW_MODE_AUTO that is currently on, computes the
+//    target duty cycle and sends the PWM command to the device.
+// 4. If the algorithm yields 0 % (heater should be off), the circuit state
+//    cache is updated to reflect that and 0x00 is sent.
+//
+// Rate-limited: does nothing if called within kDewUpdateIntervalMs of the
+// last update (uses TickCountInterface).
+//
+// Never returns a fatal error to the caller — sensor failures are handled
+// internally via the per-heater fallback configuration.
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::updateDewControl()
+{
+    if (!m_bLinked)
+        return ERR_COMMNOLINK;
+
+    // Rate-limit: skip if updated recently.
+    unsigned long now = m_pTickCount ? m_pTickCount->elapsed() : 0;
+    if (m_nLastDewUpdateTick != 0 && now != 0 &&
+        (now - m_nLastDewUpdateTick) < kDewUpdateIntervalMs)
+        return SB_OK;
+
+    m_nLastDewUpdateTick = now;
+
+    // --- Read sensors ---
+    double tempC    = 0.0;
+    double humidity = 0.0;
+    int nErrT = cmdReadSHT40Temp(tempC);
+    int nErrH = cmdReadSHT40Humidity(humidity);
+
+    if (nErrT == SB_OK && nErrH == SB_OK &&
+        humidity >= 0.0 && humidity <= 100.0)
+    {
+        m_dAmbientTempC         = tempC;
+        m_dAmbientHumidityPct   = humidity;
+        m_dDewPointC            = calcDewPoint(tempC, humidity);
+        m_bSensorValid          = true;
+
+        if (m_pLogger)
+        {
+            char szMsg[128];
+            snprintf(szMsg, sizeof(szMsg),
+                     "X2Svbony241Pro: dew update — ambient %.1f°C  RH %.0f%%  dewpoint %.1f°C",
+                     m_dAmbientTempC, m_dAmbientHumidityPct, m_dDewPointC);
+            m_pLogger->out(szMsg);
+        }
+    }
+    else
+    {
+        m_bSensorValid = false;
+        if (m_pLogger)
+            m_pLogger->out("X2Svbony241Pro: dew update — sensor read failed, applying fallback");
+    }
+
+    // --- Apply auto PWM to each heater that is on and in auto mode ---
+    for (int i = 0; i < 2; ++i)
+    {
+        if (m_eDewMode[i] != DEW_MODE_AUTO)
+            continue;
+        if (!m_bCircuitState[4 + i])
+            continue;
+
+        int duty = calcAutoDutyPct(i);
+
+        if (m_pLogger)
+        {
+            char szMsg[80];
+            snprintf(szMsg, sizeof(szMsg),
+                     "X2Svbony241Pro: dew heater %d auto → %d%%", i + 1, duty);
+            m_pLogger->out(szMsg);
+        }
+
+        uint8_t raw = static_cast<uint8_t>(
+            floor(255.0 * static_cast<double>(duty) / 100.0 + 0.5));
+
+        // Send the new PWM value to the device.
+        // Non-fatal: if the command fails we keep the cached state unchanged
+        // and will retry on the next poll cycle.
+        int nErr = cmdSetPort(kPortIndex[4 + i], raw);
+        if (nErr == SB_OK && duty == 0)
+        {
+            // Algorithm says fully off — reflect that in the circuit cache so
+            // TheSkyX sees the heater as off.
+            m_bCircuitState[4 + i] = false;
+        }
+    }
+
+    return SB_OK;
+}
+
+// ---------------------------------------------------------------------------
+// saveDewConfig
+//
+// Writes per-heater dew control settings to the TheSkyX ini store so they
+// survive across sessions.  Called from terminateLink().
+// ---------------------------------------------------------------------------
+void X2Svbony241Pro::saveDewConfig()
+{
+    if (m_pIniUtil == NULL)
+        return;
+
+    // Build instance-scoped key names so multiple devices don't collide.
+    char szKey[64];
+    for (int i = 0; i < 2; ++i)
+    {
+        snprintf(szKey, sizeof(szKey), "DewMode%d_%d",           i, m_nInstanceIndex);
+        m_pIniUtil->writeInt(kIniSection, szKey, static_cast<int>(m_eDewMode[i]));
+
+        snprintf(szKey, sizeof(szKey), "DewFixedDuty%d_%d",      i, m_nInstanceIndex);
+        m_pIniUtil->writeInt(kIniSection, szKey, m_nDewFixedDutyPct[i]);
+
+        snprintf(szKey, sizeof(szKey), "DewAggressiveness%d_%d", i, m_nInstanceIndex);
+        m_pIniUtil->writeInt(kIniSection, szKey, m_nDewAggressiveness[i]);
+
+        snprintf(szKey, sizeof(szKey), "DewFallback%d_%d",       i, m_nInstanceIndex);
+        m_pIniUtil->writeInt(kIniSection, szKey, static_cast<int>(m_eDewFallback[i]));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// loadDewConfig
+//
+// Reads per-heater dew control settings from the TheSkyX ini store.
+// Called from establishLink() before any device commands are sent.
+// Missing keys leave the in-memory defaults untouched.
+// ---------------------------------------------------------------------------
+void X2Svbony241Pro::loadDewConfig()
+{
+    if (m_pIniUtil == NULL)
+        return;
+
+    char szKey[64];
+    int  nVal = 0;
+
+    for (int i = 0; i < 2; ++i)
+    {
+        snprintf(szKey, sizeof(szKey), "DewMode%d_%d", i, m_nInstanceIndex);
+        m_pIniUtil->readInt(kIniSection, szKey,
+                            static_cast<int>(kDefaultDewMode), nVal);
+        m_eDewMode[i] = (nVal == static_cast<int>(DEW_MODE_AUTO))
+                        ? DEW_MODE_AUTO : DEW_MODE_MANUAL;
+
+        snprintf(szKey, sizeof(szKey), "DewFixedDuty%d_%d", i, m_nInstanceIndex);
+        m_pIniUtil->readInt(kIniSection, szKey, kDefaultDewDutyPct, nVal);
+        if (nVal < 0)   nVal = 0;
+        if (nVal > 100) nVal = 100;
+        m_nDewFixedDutyPct[i] = nVal;
+
+        snprintf(szKey, sizeof(szKey), "DewAggressiveness%d_%d", i, m_nInstanceIndex);
+        m_pIniUtil->readInt(kIniSection, szKey, kDefaultDewAggressiveness, nVal);
+        if (nVal < 1)  nVal = 1;
+        if (nVal > 10) nVal = 10;
+        m_nDewAggressiveness[i] = nVal;
+
+        snprintf(szKey, sizeof(szKey), "DewFallback%d_%d", i, m_nInstanceIndex);
+        m_pIniUtil->readInt(kIniSection, szKey,
+                            static_cast<int>(kDefaultDewFallback), nVal);
+        m_eDewFallback[i] = (nVal == static_cast<int>(DEW_FALLBACK_ON))
+                            ? DEW_FALLBACK_ON : DEW_FALLBACK_OFF;
+    }
+
+    if (m_pLogger)
+    {
+        char szMsg[160];
+        snprintf(szMsg, sizeof(szMsg),
+                 "X2Svbony241Pro: dew config loaded — "
+                 "H1 mode=%s agg=%d fallback=%s fixed=%d%%  "
+                 "H2 mode=%s agg=%d fallback=%s fixed=%d%%",
+                 m_eDewMode[0] == DEW_MODE_AUTO ? "AUTO" : "MANUAL",
+                 m_nDewAggressiveness[0],
+                 m_eDewFallback[0] == DEW_FALLBACK_ON ? "ON" : "OFF",
+                 m_nDewFixedDutyPct[0],
+                 m_eDewMode[1] == DEW_MODE_AUTO ? "AUTO" : "MANUAL",
+                 m_nDewAggressiveness[1],
+                 m_eDewFallback[1] == DEW_FALLBACK_ON ? "ON" : "OFF",
+                 m_nDewFixedDutyPct[1]);
+        m_pLogger->out(szMsg);
+    }
 }
