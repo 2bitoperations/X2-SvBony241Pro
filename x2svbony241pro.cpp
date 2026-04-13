@@ -125,8 +125,14 @@ X2Svbony241Pro::~X2Svbony241Pro()
 int X2Svbony241Pro::queryAbstraction(const char* pszName, void** ppVal)
 {
     *ppVal = NULL;
+
     if (!strcmp(pszName, LoggerInterface::IID_LoggerInterface))
         *ppVal = m_pLogger;
+    else if (!strcmp(pszName, ModalSettingsDialogInterface_Name))
+        *ppVal = dynamic_cast<ModalSettingsDialogInterface*>(this);
+    else if (!strcmp(pszName, X2GUIEventInterface_Name))
+        *ppVal = dynamic_cast<X2GUIEventInterface*>(this);
+
     return SB_OK;   // return SB_OK even for unknown interfaces (*ppVal == NULL)
 }
 
@@ -1129,5 +1135,328 @@ void X2Svbony241Pro::loadDewConfig()
                  m_eDewFallback[1] == DEW_FALLBACK_ON ? "ON" : "OFF",
                  m_nDewFixedDutyPct[1]);
         m_pLogger->out(szMsg);
+    }
+}
+
+// ===========================================================================
+// Setup dialog  (ModalSettingsDialogInterface + X2GUIEventInterface)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Helper: show or hide all auto-only rows for one heater in the dialog.
+// heaterIdx 0 = Dew Heater 1, 1 = Dew Heater 2.
+// bAutoMode true → show the auto-only widgets; false → hide them.
+// ---------------------------------------------------------------------------
+static void setDewAutoRowsVisible(X2GUIExchangeInterface* uiex, int heaterIdx, bool bAutoMode)
+{
+    // Widget name suffix: "" for heater 0, "2" for heater 1 — matches the .ui names
+    // dew1 = heaterIdx 0, dew2 = heaterIdx 1
+    const char* suffix = (heaterIdx == 0) ? "1" : "2";
+
+    char szName[64];
+    const char* kAutoWidgets[] = {
+        "label_dew%sAggCaption",
+        "spinBox_dew%sAggressiveness",
+        "label_dew%sAggHint",
+        "label_dew%sFallbackCaption",
+        "comboBox_dew%sFallback",
+        "label_dew%sAutoDutyCaption",
+        "label_dew%sAutoDuty",
+    };
+    const char* method = bAutoMode ? "show" : "hide";
+
+    for (int i = 0; i < 7; ++i)
+    {
+        snprintf(szName, sizeof(szName), kAutoWidgets[i], suffix);
+        uiex->invokeMethod(szName, method);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// execModalSettingsDialog
+//
+// Loads sv241pro.ui, pre-populates controls from current driver state,
+// runs the dialog modally, and saves settings on OK.
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::execModalSettingsDialog()
+{
+    X2ModalUIUtil uiutil(this, m_pTheSkyX);
+    X2GUIInterface* pUI = uiutil.X2UI();
+    if (pUI == NULL)
+        return ERR_POINTER;
+
+    X2GUIExchangeInterface* uiex = NULL;
+    bool bPressedOK = false;
+    int  nErr = SB_OK;
+
+    do {
+        nErr = pUI->loadUserInterface("sv241pro.ui", deviceType(), m_nInstanceIndex);
+        if (nErr) break;
+
+        uiex = pUI->X2DX();
+        if (uiex == NULL) { nErr = ERR_POINTER; break; }
+
+        // --- Populate static labels ---
+        uiex->setText("label_connStatus",
+                       m_bLinked ? "Connected" : "Not connected");
+        uiex->setText("label_sensorStatus",
+                       m_bSensorValid ? "OK" : (m_bLinked ? "Read error" : "—"));
+
+        if (m_bLinked && m_bSensorValid)
+        {
+            char szBuf[64];
+            snprintf(szBuf, sizeof(szBuf), "%.1f °C", m_dAmbientTempC);
+            uiex->setText("label_ambientTemp", szBuf);
+
+            snprintf(szBuf, sizeof(szBuf), "%.1f %%", m_dAmbientHumidityPct);
+            uiex->setText("label_humidity", szBuf);
+
+            snprintf(szBuf, sizeof(szBuf), "%.1f °C", m_dDewPointC);
+            uiex->setText("label_dewPoint", szBuf);
+        }
+
+        // DS18B20 and INA219 — attempt a quick live read if linked
+        if (m_bLinked)
+        {
+            char szBuf[64];
+            double val = 0.0;
+
+            if (cmdReadDS18B20Temp(val) == SB_OK)
+            {
+                snprintf(szBuf, sizeof(szBuf), "%.1f °C", val);
+                uiex->setText("label_lensTemp", szBuf);
+            }
+            if (cmdReadVoltage(val) == SB_OK)
+            {
+                snprintf(szBuf, sizeof(szBuf), "%.2f V", val);
+                uiex->setText("label_voltage", szBuf);
+            }
+            if (cmdReadCurrent(val) == SB_OK)
+            {
+                snprintf(szBuf, sizeof(szBuf), "%.3f A", val);
+                uiex->setText("label_current", szBuf);
+            }
+
+            // Port states from cache
+            const char* kDCLabels[] = { "label_dc1","label_dc2","label_dc3","label_dc4" };
+            for (int i = 0; i < 4; ++i)
+                uiex->setText(kDCLabels[i], m_bCircuitState[i] ? "ON" : "OFF");
+            uiex->setText("label_usb",
+                           m_bCircuitState[6] ? "ON" : "OFF");
+
+            if (m_bCircuitState[7])
+            {
+                snprintf(szBuf, sizeof(szBuf), "%.1f V", m_dRegulatedVoltageV);
+                uiex->setText("label_regulated", szBuf);
+            }
+            else
+            {
+                uiex->setText("label_regulated", "OFF");
+            }
+        }
+
+        // --- Dew heater settings ---
+        for (int i = 0; i < 2; ++i)
+        {
+            const char* modeCombo  = (i == 0) ? "comboBox_dew1Mode"         : "comboBox_dew2Mode";
+            const char* dutyBox    = (i == 0) ? "spinBox_dew1FixedDuty"     : "spinBox_dew2FixedDuty";
+            const char* aggBox     = (i == 0) ? "spinBox_dew1Aggressiveness" : "spinBox_dew2Aggressiveness";
+            const char* fallCombo  = (i == 0) ? "comboBox_dew1Fallback"     : "comboBox_dew2Fallback";
+            const char* autoDuty   = (i == 0) ? "label_dew1AutoDuty"        : "label_dew2AutoDuty";
+
+            uiex->setCurrentIndex(modeCombo,
+                                  (m_eDewMode[i] == DEW_MODE_AUTO) ? 1 : 0);
+            uiex->setPropertyInt(dutyBox, "value", m_nDewFixedDutyPct[i]);
+            uiex->setPropertyInt(aggBox,  "value", m_nDewAggressiveness[i]);
+            uiex->setCurrentIndex(fallCombo,
+                                  (m_eDewFallback[i] == DEW_FALLBACK_ON) ? 1 : 0);
+
+            // Show/hide auto-only rows
+            bool bAuto = (m_eDewMode[i] == DEW_MODE_AUTO);
+            setDewAutoRowsVisible(uiex, i, bAuto);
+
+            // Computed duty label
+            if (bAuto && m_bSensorValid)
+            {
+                char szBuf[32];
+                snprintf(szBuf, sizeof(szBuf), "%d %%", calcAutoDutyPct(i));
+                uiex->setText(autoDuty, szBuf);
+            }
+        }
+
+        nErr = pUI->exec(bPressedOK);
+        if (nErr) break;
+
+        if (bPressedOK)
+        {
+            // Read back dew heater settings and persist
+            for (int i = 0; i < 2; ++i)
+            {
+                const char* modeCombo = (i == 0) ? "comboBox_dew1Mode"          : "comboBox_dew2Mode";
+                const char* dutyBox   = (i == 0) ? "spinBox_dew1FixedDuty"      : "spinBox_dew2FixedDuty";
+                const char* aggBox    = (i == 0) ? "spinBox_dew1Aggressiveness"  : "spinBox_dew2Aggressiveness";
+                const char* fallCombo = (i == 0) ? "comboBox_dew1Fallback"      : "comboBox_dew2Fallback";
+
+                m_eDewMode[i]           = (uiex->currentIndex(modeCombo) == 1)
+                                          ? DEW_MODE_AUTO : DEW_MODE_MANUAL;
+                m_eDewFallback[i]       = (uiex->currentIndex(fallCombo) == 1)
+                                          ? DEW_FALLBACK_ON : DEW_FALLBACK_OFF;
+
+                int nDuty = 50, nAgg = 5;
+                uiex->propertyInt(dutyBox, "value", nDuty);
+                uiex->propertyInt(aggBox,  "value", nAgg);
+
+                if (nDuty < 0)   nDuty = 0;
+                if (nDuty > 100) nDuty = 100;
+                if (nAgg  < 1)   nAgg  = 1;
+                if (nAgg  > 10)  nAgg  = 10;
+
+                m_nDewFixedDutyPct[i]   = nDuty;
+                m_nDewAggressiveness[i] = nAgg;
+            }
+
+            saveDewConfig();
+
+            // Force an immediate auto-control update so the new settings take effect now
+            if (m_bLinked)
+            {
+                m_nLastDewUpdateTick = 0;
+                updateDewControl();
+            }
+        }
+
+    } while (false);
+
+    return nErr;
+}
+
+// ---------------------------------------------------------------------------
+// uiEvent
+//
+// Called by TheSkyX for every GUI event while the dialog is open.
+//
+// "on_timer"
+//     Refresh the live-data labels: port states, sensor readings, computed duty.
+//
+// "on_comboBox_dew{1,2}Mode_currentIndexChanged"
+//     Show or hide the auto-only rows depending on selected mode.
+// ---------------------------------------------------------------------------
+void X2Svbony241Pro::uiEvent(X2GUIExchangeInterface* uiex, const char* pszEvent)
+{
+    if (uiex == NULL || pszEvent == NULL)
+        return;
+
+    // ── Timer tick: refresh live data ────────────────────────────────────
+    if (!strcmp(pszEvent, "on_timer"))
+    {
+        if (!m_bLinked)
+        {
+            uiex->setText("label_connStatus", "Not connected");
+            return;
+        }
+
+        // Refresh port state cache (single fast command)
+        queryAllCircuitStates();
+
+        // Trigger sensor read at the normal auto-dew rate (30 s throttle)
+        updateDewControl();
+
+        // Update connection / sensor status badges
+        uiex->setText("label_connStatus", "Connected");
+        uiex->setText("label_sensorStatus", m_bSensorValid ? "OK" : "Read error");
+
+        // Environmental sensor labels
+        char szBuf[64];
+        if (m_bSensorValid)
+        {
+            snprintf(szBuf, sizeof(szBuf), "%.1f °C", m_dAmbientTempC);
+            uiex->setText("label_ambientTemp", szBuf);
+
+            snprintf(szBuf, sizeof(szBuf), "%.1f %%", m_dAmbientHumidityPct);
+            uiex->setText("label_humidity", szBuf);
+
+            snprintf(szBuf, sizeof(szBuf), "%.1f °C", m_dDewPointC);
+            uiex->setText("label_dewPoint", szBuf);
+        }
+        else
+        {
+            uiex->setText("label_ambientTemp", "—");
+            uiex->setText("label_humidity",    "—");
+            uiex->setText("label_dewPoint",    "—");
+        }
+
+        // DS18B20 — read live (one command, ~200ms with sleep)
+        double val = 0.0;
+        if (cmdReadDS18B20Temp(val) == SB_OK)
+        {
+            snprintf(szBuf, sizeof(szBuf), "%.1f °C", val);
+            uiex->setText("label_lensTemp", szBuf);
+        }
+
+        // INA219 voltage and current
+        if (cmdReadVoltage(val) == SB_OK)
+        {
+            snprintf(szBuf, sizeof(szBuf), "%.2f V", val);
+            uiex->setText("label_voltage", szBuf);
+        }
+        if (cmdReadCurrent(val) == SB_OK)
+        {
+            snprintf(szBuf, sizeof(szBuf), "%.3f A", val);
+            uiex->setText("label_current", szBuf);
+        }
+
+        // DC port on/off states
+        const char* kDCLabels[] = { "label_dc1","label_dc2","label_dc3","label_dc4" };
+        for (int i = 0; i < 4; ++i)
+            uiex->setText(kDCLabels[i], m_bCircuitState[i] ? "ON" : "OFF");
+
+        uiex->setText("label_usb", m_bCircuitState[6] ? "ON" : "OFF");
+
+        if (m_bCircuitState[7])
+        {
+            snprintf(szBuf, sizeof(szBuf), "%.1f V", m_dRegulatedVoltageV);
+            uiex->setText("label_regulated", szBuf);
+        }
+        else
+        {
+            uiex->setText("label_regulated", "OFF");
+        }
+
+        // Auto dew computed duty labels (reflect current algorithm output)
+        for (int i = 0; i < 2; ++i)
+        {
+            const char* autoDutyLabel = (i == 0) ? "label_dew1AutoDuty" : "label_dew2AutoDuty";
+            if (m_eDewMode[i] == DEW_MODE_AUTO)
+            {
+                if (m_bSensorValid)
+                {
+                    snprintf(szBuf, sizeof(szBuf), "%d %%", calcAutoDutyPct(i));
+                    uiex->setText(autoDutyLabel, szBuf);
+                }
+                else
+                {
+                    // Show fallback description so the user knows what the driver is doing
+                    uiex->setText(autoDutyLabel,
+                        (m_eDewFallback[i] == DEW_FALLBACK_ON) ? "fallback ON" : "fallback OFF");
+                }
+            }
+        }
+
+        return;
+    }
+
+    // ── Mode combo changed: toggle auto-only row visibility ───────────────
+    if (!strcmp(pszEvent, "on_comboBox_dew1Mode_currentIndexChanged"))
+    {
+        bool bAuto = (uiex->currentIndex("comboBox_dew1Mode") == 1);
+        setDewAutoRowsVisible(uiex, 0, bAuto);
+        return;
+    }
+
+    if (!strcmp(pszEvent, "on_comboBox_dew2Mode_currentIndexChanged"))
+    {
+        bool bAuto = (uiex->currentIndex("comboBox_dew2Mode") == 1);
+        setDewAutoRowsVisible(uiex, 1, bAuto);
+        return;
     }
 }

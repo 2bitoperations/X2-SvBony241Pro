@@ -8,6 +8,8 @@
 #include "../X2-Examples/licensedinterfaces/loggerinterface.h"
 #include "../X2-Examples/licensedinterfaces/mutexinterface.h"
 #include "../X2-Examples/licensedinterfaces/tickcountinterface.h"
+#include "../X2-Examples/licensedinterfaces/modalsettingsdialoginterface.h"
+#include "../X2-Examples/licensedinterfaces/x2guiinterface.h"
 
 #include <stdint.h>
 
@@ -53,6 +55,8 @@ enum DewFallback
 #define X2_NUM_CIRCUITS 8
 
 class X2Svbony241Pro : public PowerControlDriverInterface
+                     , public ModalSettingsDialogInterface
+                     , public X2GUIEventInterface
 {
 public:
     X2Svbony241Pro(
@@ -103,6 +107,17 @@ public:
     virtual int         circuitName(const int& nIndex, BasicStringInterface& str);
     virtual int         circuitState(const int& nIndex, bool& bOn);
     virtual int         setCircuitState(const int& nIndex, const bool& bOn);
+
+    // -----------------------------------------------------------------------
+    // ModalSettingsDialogInterface
+    // -----------------------------------------------------------------------
+    virtual int         initModalSettingsDialog()           { return SB_OK; }
+    virtual int         execModalSettingsDialog();
+
+    // -----------------------------------------------------------------------
+    // X2GUIEventInterface
+    // -----------------------------------------------------------------------
+    virtual void        uiEvent(X2GUIExchangeInterface* uiex, const char* pszEvent);
 
 private:
     // -----------------------------------------------------------------------
