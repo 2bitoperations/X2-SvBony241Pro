@@ -114,6 +114,47 @@ After restarting, the **SVBony SV241 Pro** entry will appear in the
 
 ---
 
+## Troubleshooting / Log File
+
+The driver writes a persistent plain-text log alongside the in-app
+TheSkyX Communication Log window.
+
+**Default log path:**
+
+| Platform | Path |
+|----------|------|
+| Linux / macOS | `~/TheSkyX/x2svbony241pro.log` |
+| Fallback (if `$HOME` is not set) | `/tmp/x2svbony241pro.log` |
+| Windows | `%USERPROFILE%\TheSkyX\x2svbony241pro.log` |
+
+Each line is prefixed with a local timestamp in `YYYY-MM-DD HH:MM:SS` format.
+
+**What gets logged where:**
+
+| Debug Level setting | TheSkyX window | Log file |
+|---------------------|----------------|----------|
+| 0 — Off | nothing | errors only (level 1) |
+| 1 — Errors | errors | errors |
+| 2 — Commands | errors + commands | errors + commands |
+| 3 — Full I/O | everything | everything |
+
+Level-1 (Error) messages — connection failures, protocol errors, timeouts —
+are **always** written to the log file regardless of the debug-level setting.
+This means you get a persistent record of connection problems even when the
+debug level is set to Off.
+
+To read the log on Linux/macOS, open a terminal and run:
+
+```bash
+tail -f ~/TheSkyX/x2svbony241pro.log
+```
+
+The log is opened in append mode for every message, so it survives TheSkyX
+restarts and accumulates across sessions. Truncate or delete it at any time
+to start fresh; it will be recreated automatically on the next log event.
+
+---
+
 ## Protocol
 
 The USB serial protocol for the SV241 Pro has been documented from the INDI

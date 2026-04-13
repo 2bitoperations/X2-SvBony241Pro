@@ -1,13 +1,13 @@
 #pragma once
 
-#include "../X2-Examples/licensedinterfaces/basicstringinterface.h"
-#include "../X2-Examples/licensedinterfaces/serxinterface.h"
-#include "../X2-Examples/licensedinterfaces/theskyxfacadefordriversinterface.h"
-#include "../X2-Examples/licensedinterfaces/sleeperinterface.h"
-#include "../X2-Examples/licensedinterfaces/basiciniutilinterface.h"
-#include "../X2-Examples/licensedinterfaces/loggerinterface.h"
-#include "../X2-Examples/licensedinterfaces/mutexinterface.h"
-#include "../X2-Examples/licensedinterfaces/tickcountinterface.h"
+#include "licensedinterfaces/basicstringinterface.h"
+#include "licensedinterfaces/serxinterface.h"
+#include "licensedinterfaces/theskyxfacadefordriversinterface.h"
+#include "licensedinterfaces/sleeperinterface.h"
+#include "licensedinterfaces/basiciniutilinterface.h"
+#include "licensedinterfaces/loggerinterface.h"
+#include "licensedinterfaces/mutexinterface.h"
+#include "licensedinterfaces/tickcountinterface.h"
 
 #ifdef _WIN32
 #define PlugInExport __declspec(dllexport)

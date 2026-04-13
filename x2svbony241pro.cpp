@@ -1,8 +1,12 @@
 #include "x2svbony241pro.h"
 
 #include <string.h>
+#include <string>
 #include <stdio.h>
 #include <math.h>
+#include <stdarg.h>
+#include <time.h>
+#include <stdlib.h>
 
 // ---------------------------------------------------------------------------
 // Circuit name table — keep in sync with X2 circuit index definitions
@@ -40,11 +44,12 @@ static const int     kBaudRate              = 115200;
 static const uint8_t kFrameHeader           = 0x24;
 static const uint8_t kStatusFailure         = 0xAA;
 
-static const int     kPostWriteSleepMs      = 100;  // mirrors INDI tcdrain+sleep
+static const int     kPostWriteSleepMs      = 50;   // post-write settling time (was 100 ms)
 static const int     kReadTimeoutMs         = 500;  // max wait for response bytes
-static const int     kBootDrainInitSleepMs  = 500;  // initial wait for ESP32 boot
-static const int     kBootDrainRetries      = 10;
-static const int     kBootDrainSleepMs      = 50;
+static const int     kBootDrainInitSleepMs  = 300;  // initial wait for ESP32 boot (was 500 ms)
+static const int     kBootDrainRetries      = 6;    // max drain iterations (was 10)
+static const int     kBootDrainSleepMs      = 30;   // sleep between drain reads (was 50 ms)
+static const int     kBootDrainMaxMs        = 400;  // hard wall-clock cap for entire drain phase
 static const int     kPowerCycleSleepMs     = 1000;
 
 // Default analogue levels used when toggling an analogue channel ON for the first time
@@ -55,10 +60,20 @@ static const double  kDefaultRegulatedVoltageV  = 12.0;  // 12 V
 static const int           kDefaultDewAggressiveness  = 5;           // mid-range
 static const DewHeaterMode kDefaultDewMode             = DEW_MODE_MANUAL;
 static const DewFallback   kDefaultDewFallback         = DEW_FALLBACK_ON;
-static const unsigned long kDewUpdateIntervalMs        = 30000;       // 30 s between sensor reads
+static const int           kDewUpdateIntervalMs        = 30000;       // 30 s between sensor reads
 
 // Ini section key for persisted dew settings
 static const char* kIniSection = "SV241Pro";
+
+// Ini keys for serial port selection
+static const char* kIniKeyPortName  = "PortName";
+static const char* kDefaultPortName = "No port selected";
+
+// Debug level constants (also used as comboBox index in the UI)
+static const int kDebugOff      = 0;
+static const int kDebugErrors   = 1;
+static const int kDebugCommands = 2;
+static const int kDebugFullIO   = 3;
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -83,6 +98,7 @@ X2Svbony241Pro::X2Svbony241Pro(
     , m_pTickCount          (pTickCountIn)
     , m_nInstanceIndex      (nInstanceIndex)
     , m_bLinked             (false)
+    , m_nDebugLevel         (kDebugOff)
     , m_dPowerW             (0.0)
     , m_dVoltageV           (0.0)
     , m_dCurrentA           (0.0)
@@ -119,6 +135,74 @@ X2Svbony241Pro::~X2Svbony241Pro()
 }
 
 // ---------------------------------------------------------------------------
+// logDebug
+//
+// Writes a formatted message to:
+//   1. The TheSkyX Communication Log window (via LoggerInterface::out) if
+//      m_nDebugLevel >= minLevel.
+//   2. A plain-text file (append mode, one fopen/fclose per call) at:
+//        $HOME/TheSkyX/x2svbony241pro.log   (preferred)
+//        /tmp/x2svbony241pro.log             (fallback if HOME is unset)
+//      Level-1 (Error) messages are always written to the file, regardless of
+//      m_nDebugLevel.  Levels 2 and 3 are gated by m_nDebugLevel as usual.
+//
+// This means connection failures and hard errors produce a persistent record
+// even when the user has not opened the TSX Communication Log window.
+//
+// minLevel: 1=Errors, 2=Commands, 3=Full I/O.
+// ---------------------------------------------------------------------------
+void X2Svbony241Pro::logDebug(int minLevel, const char* fmt, ...) const
+{
+    // Decide whether this message reaches each sink.
+    const bool bSendToTSX  = (m_pLogger != NULL) && (m_nDebugLevel >= minLevel);
+    const bool bSendToFile = (minLevel == 1) || (m_nDebugLevel >= minLevel);
+
+    if (!bSendToTSX && !bSendToFile)
+        return;
+
+    // Format the message body.
+    char szBuf[384];   // large enough for the dew-config summary line (~180 chars)
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(szBuf, sizeof(szBuf), fmt, args);
+    va_end(args);
+
+    // --- TheSkyX Communication Log window ---
+    if (bSendToTSX)
+        m_pLogger->out(szBuf);
+
+    // --- Persistent file log ---
+    if (bSendToFile)
+    {
+        // Build log path: $HOME/TheSkyX/x2svbony241pro.log, or /tmp fallback.
+        char szLogPath[512];
+        const char* pszHome = getenv("HOME");
+        if (pszHome && pszHome[0] != '\0')
+            snprintf(szLogPath, sizeof(szLogPath),
+                     "%s/TheSkyX/x2svbony241pro.log", pszHome);
+        else
+            snprintf(szLogPath, sizeof(szLogPath),
+                     "/tmp/x2svbony241pro.log");
+
+        // Build a human-readable local timestamp.
+        char szTime[32];
+        time_t now = time(NULL);
+        struct tm* pTm = localtime(&now);
+        if (pTm)
+            strftime(szTime, sizeof(szTime), "%Y-%m-%d %H:%M:%S", pTm);
+        else
+            snprintf(szTime, sizeof(szTime), "0000-00-00 00:00:00");
+
+        FILE* pf = fopen(szLogPath, "a");
+        if (pf)
+        {
+            fprintf(pf, "[%s] %s\n", szTime, szBuf);
+            fclose(pf);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DriverRootInterface
 // ---------------------------------------------------------------------------
 
@@ -126,14 +210,47 @@ int X2Svbony241Pro::queryAbstraction(const char* pszName, void** ppVal)
 {
     *ppVal = NULL;
 
-    if (!strcmp(pszName, LoggerInterface::IID_LoggerInterface))
+    if (!strcmp(pszName, LoggerInterface_Name))
         *ppVal = m_pLogger;
     else if (!strcmp(pszName, ModalSettingsDialogInterface_Name))
         *ppVal = dynamic_cast<ModalSettingsDialogInterface*>(this);
     else if (!strcmp(pszName, X2GUIEventInterface_Name))
         *ppVal = dynamic_cast<X2GUIEventInterface*>(this);
+    else if (!strcmp(pszName, CircuitLabelsInterface_Name))
+        *ppVal = dynamic_cast<CircuitLabelsInterface*>(this);
+    else if (!strcmp(pszName, SerialPortParams2Interface_Name))
+        *ppVal = dynamic_cast<SerialPortParams2Interface*>(this);
 
     return SB_OK;   // return SB_OK even for unknown interfaces (*ppVal == NULL)
+}
+
+// ---------------------------------------------------------------------------
+// SerialPortParams2Interface
+// ---------------------------------------------------------------------------
+
+void X2Svbony241Pro::getPortName(std::string& sPortName) const
+{
+    sPortName = kDefaultPortName;
+    if (m_pIniUtil)
+    {
+        char szPort[256];
+        m_pIniUtil->readString(kIniSection, kIniKeyPortName,
+                               kDefaultPortName, szPort, sizeof(szPort));
+        sPortName = szPort;
+    }
+}
+
+void X2Svbony241Pro::portName(BasicStringInterface& str) const
+{
+    std::string sPortName;
+    getPortName(sPortName);
+    str = sPortName.c_str();
+}
+
+void X2Svbony241Pro::setPortName(const char* szPort)
+{
+    if (m_pIniUtil)
+        m_pIniUtil->writeString(kIniSection, kIniKeyPortName, szPort);
 }
 
 // ---------------------------------------------------------------------------
@@ -184,14 +301,31 @@ int X2Svbony241Pro::establishLink()
     if (m_pSerX == NULL)
         return ERR_COMMNOLINK;
 
+    // Capture a start tick so we can log total establishLink() elapsed time.
+    // This makes it easy to correlate the log against any perceived UI freeze.
+    int nLinkStartTick = m_pTickCount ? m_pTickCount->elapsed() : 0;
+
     // Open the USB virtual COM port at 115200 8N1, no parity, no flow control.
-    int nErr = m_pSerX->open(NULL, kBaudRate, SerXInterface::B_NOPARITY, 0);
+    // Use the port name selected by the user via SerialPortParams2Interface.
+    std::string sPortName;
+    getPortName(sPortName);
+
+    logDebug(kDebugErrors, "X2Svbony241Pro: establishLink start (port=%s)", sPortName.c_str());
+
+    int nErr = m_pSerX->open(sPortName.c_str(), kBaudRate, SerXInterface::B_NOPARITY, 0);
     if (nErr != SB_OK)
+    {
+        logDebug(kDebugErrors, "X2Svbony241Pro: serial port open failed (err %d)", nErr);
         return nErr;
+    }
 
-    m_bLinked = true;
+    // Keep m_bLinked = false throughout the drain+handshake window.  TSX
+    // polling threads check m_bLinked before entering sendFrame; keeping it
+    // false here ensures they return ERR_COMMNOLINK rather than racing with
+    // drainBootLog() or the handshake command on the freshly-opened port.
 
-    // Restore persisted dew-heater configuration before touching the device.
+    // Restore persisted configuration before touching the device.
+    loadDebugLevel();
     loadDewConfig();
 
     // Drain the ESP32 boot log.  The device resets when the serial port opens;
@@ -199,38 +333,54 @@ int X2Svbony241Pro::establishLink()
     // Non-fatal: if drain times out we attempt the handshake anyway.
     (void)drainBootLog();
 
-    // Handshake: cmd 0x08 (full state query).  If the device responds correctly
-    // we consider the link established and pre-populate the circuit cache.
+    int nAfterDrainMs = m_pTickCount ? (m_pTickCount->elapsed() - nLinkStartTick) : -1;
+    logDebug(kDebugErrors, "X2Svbony241Pro: drain phase done at +%d ms — starting handshake",
+             nAfterDrainMs);
+
+    // Handshake: cmd 0x08 (full state query).  Set m_bLinked now so that
+    // sendFrame's guard passes.  If the handshake fails, clear m_bLinked
+    // before closing the port so the driver is left in a clean "not connected"
+    // state and no subsequent I/O is attempted on the closed port.
+    m_bLinked = true;
+
     uint8_t state10[10] = {0};
     nErr = cmdGetState(state10);
     if (nErr != SB_OK)
     {
-        if (m_pLogger)
-            m_pLogger->out("X2Svbony241Pro: handshake failed — closing port");
-        m_pSerX->close();
+        int nFailMs = m_pTickCount ? (m_pTickCount->elapsed() - nLinkStartTick) : -1;
+        logDebug(kDebugErrors,
+                 "X2Svbony241Pro: handshake failed at +%d ms (err %d) — closing port",
+                 nFailMs, nErr);
         m_bLinked = false;
+        m_pSerX->close();
         return nErr;
     }
 
     parseStateResponse(state10);
 
-    if (m_pLogger)
-        m_pLogger->out("X2Svbony241Pro: link established");
+    int nTotalMs = m_pTickCount ? (m_pTickCount->elapsed() - nLinkStartTick) : -1;
+    logDebug(kDebugErrors, "X2Svbony241Pro: link established (total=%d ms)", nTotalMs);
 
     return SB_OK;
 }
 
 int X2Svbony241Pro::terminateLink()
 {
+    saveDebugLevel();
     saveDewConfig();
 
-    if (m_pSerX != NULL)
-        m_pSerX->close();
+    // Clear m_bLinked and close the port under the mutex.  Any thread that is
+    // blocked waiting to acquire the lock inside sendFrame() will re-check
+    // m_bLinked after acquiring the lock and return ERR_COMMNOLINK rather
+    // than issuing I/O on the now-closed port.
+    {
+        X2MutexLocker ml(m_pIOMutex);
+        m_bLinked = false;
+        if (m_pSerX != NULL)
+            m_pSerX->close();
+    }
 
-    m_bLinked = false;
-
-    if (m_pLogger)
-        m_pLogger->out("X2Svbony241Pro: link terminated");
+    logDebug(kDebugCommands, "X2Svbony241Pro: link terminated");
 
     return SB_OK;
 }
@@ -252,9 +402,23 @@ int X2Svbony241Pro::circuitName(const int& nIndex, BasicStringInterface& str)
     if (nIndex < 0 || nIndex >= X2_NUM_CIRCUITS)
     {
         str = "Unknown";
-        return ERR_DATAOUT_OF_RANGE;
+        return ERR_INDEX_OUT_OF_RANGE;
     }
     str = kCircuitNames[nIndex];
+    return SB_OK;
+}
+
+// ---------------------------------------------------------------------------
+// CircuitLabelsInterface — lets TheSkyX display human-readable port names
+// ---------------------------------------------------------------------------
+int X2Svbony241Pro::circuitLabel(const int& nZeroBasedIndex, BasicStringInterface& str)
+{
+    if (nZeroBasedIndex < 0 || nZeroBasedIndex >= X2_NUM_CIRCUITS)
+    {
+        str = "Unknown";
+        return ERR_INDEX_OUT_OF_RANGE;
+    }
+    str = kCircuitNames[nZeroBasedIndex];
     return SB_OK;
 }
 
@@ -263,21 +427,18 @@ int X2Svbony241Pro::circuitState(const int& nIndex, bool& bOn)
     if (!m_bLinked)
         return ERR_COMMNOLINK;
     if (nIndex < 0 || nIndex >= X2_NUM_CIRCUITS)
-        return ERR_DATAOUT_OF_RANGE;
+        return ERR_INDEX_OUT_OF_RANGE;
 
-    // For dew heater circuits in auto mode, check whether it is time to run
-    // a sensor read and PWM update.  TheSkyX polls circuitState() periodically,
-    // so this is the natural place to drive the control loop.
-    if (nIndex == 4 || nIndex == 5)
-    {
-        int heaterIdx = nIndex - 4;
-        if (m_eDewMode[heaterIdx] == DEW_MODE_AUTO && m_bCircuitState[nIndex])
-        {
-            unsigned long now = m_pTickCount ? m_pTickCount->elapsed() : 0;
-            if (now == 0 || (now - m_nLastDewUpdateTick) >= kDewUpdateIntervalMs)
-                updateDewControl();
-        }
-    }
+    // Drive the auto-dew control loop on every poll call, not just when TSX
+    // happens to query a dew-heater circuit.  TSX may poll all eight circuits
+    // in sequence; we want the update to fire as long as at least one heater is
+    // in AUTO mode and is on, regardless of which circuit index triggered this.
+    // updateDewControl() is itself rate-limited to kDewUpdateIntervalMs and
+    // returns immediately when the interval has not elapsed.
+    bool bAnyAutoDewActive = (m_eDewMode[0] == DEW_MODE_AUTO && m_bCircuitState[4])
+                           || (m_eDewMode[1] == DEW_MODE_AUTO && m_bCircuitState[5]);
+    if (bAnyAutoDewActive)
+        updateDewControl();
 
     bOn = m_bCircuitState[nIndex];
     return SB_OK;
@@ -288,7 +449,10 @@ int X2Svbony241Pro::setCircuitState(const int& nIndex, const bool& bOn)
     if (!m_bLinked)
         return ERR_COMMNOLINK;
     if (nIndex < 0 || nIndex >= X2_NUM_CIRCUITS)
-        return ERR_DATAOUT_OF_RANGE;
+        return ERR_INDEX_OUT_OF_RANGE;
+
+    logDebug(kDebugCommands, "X2Svbony241Pro: setCircuitState circuit=%d (%s) → %s",
+             nIndex, kCircuitNames[nIndex], bOn ? "ON" : "OFF");
 
     uint8_t portIdx = portIndexForCircuit(nIndex);
     int     nErr    = SB_OK;
@@ -310,6 +474,9 @@ int X2Svbony241Pro::setCircuitState(const int& nIndex, const bool& bOn)
         nErr = cmdSetPort(portIdx, value);
         if (nErr == SB_OK)
             m_bCircuitState[nIndex] = bOn;
+        else
+            logDebug(kDebugErrors, "X2Svbony241Pro: setCircuitState circuit=%d failed (err %d)",
+                     nIndex, nErr);
     }
 
     return nErr;
@@ -367,6 +534,16 @@ uint8_t X2Svbony241Pro::calcChecksum(const uint8_t* pBuf, int nLen) const
 int X2Svbony241Pro::sendFrame(const uint8_t* pCmd, int nCmdLen,
                                int nResDataLen, uint8_t* pResDataOut)
 {
+    // Fast pre-check before acquiring the lock (optimistic path).
+    if (!m_bLinked || m_pSerX == NULL)
+        return ERR_COMMNOLINK;
+
+    // Serialize all serial I/O through the TSX-provided mutex.
+    X2MutexLocker ml(m_pIOMutex);
+
+    // Re-check m_bLinked inside the lock.  terminateLink() clears m_bLinked
+    // and closes the port while holding the same mutex, so by the time we
+    // acquire the lock here the flag is guaranteed to reflect the actual state.
     if (!m_bLinked || m_pSerX == NULL)
         return ERR_COMMNOLINK;
 
@@ -374,6 +551,15 @@ int X2Svbony241Pro::sendFrame(const uint8_t* pCmd, int nCmdLen,
     uint8_t frame[16];
     int nFrameLen = 0;
     buildFrame(pCmd, nCmdLen, frame, nFrameLen);
+
+    if (m_nDebugLevel >= kDebugFullIO)
+    {
+        char szHex[64];
+        int pos = 0;
+        for (int i = 0; i < nFrameLen && pos < (int)sizeof(szHex) - 4; ++i)
+            pos += snprintf(szHex + pos, sizeof(szHex) - pos, "%02X ", frame[i]);
+        logDebug(kDebugFullIO, "X2Svbony241Pro: TX [%s]", szHex);
+    }
 
     // Flush stale bytes before writing
     m_pSerX->purgeTxRx();
@@ -383,12 +569,12 @@ int X2Svbony241Pro::sendFrame(const uint8_t* pCmd, int nCmdLen,
     int nErr = m_pSerX->writeFile(frame, (unsigned long)nFrameLen, nWritten);
     if (nErr != SB_OK)
     {
-        if (m_pLogger) m_pLogger->out("X2Svbony241Pro: writeFile error");
+        logDebug(kDebugErrors, "X2Svbony241Pro: writeFile error %d", nErr);
         return nErr;
     }
     if ((int)nWritten != nFrameLen)
     {
-        if (m_pLogger) m_pLogger->out("X2Svbony241Pro: writeFile short write");
+        logDebug(kDebugErrors, "X2Svbony241Pro: short write %lu/%d", nWritten, nFrameLen);
         return ERR_CMDFAILED;
     }
 
@@ -407,18 +593,28 @@ int X2Svbony241Pro::sendFrame(const uint8_t* pCmd, int nCmdLen,
     // Flush after read to clear any residual bytes
     m_pSerX->purgeTxRx();
 
+    if (m_nDebugLevel >= kDebugFullIO)
+    {
+        char szHex[64];
+        int pos = 0;
+        for (int i = 0; i < nFullResLen && pos < (int)sizeof(szHex) - 4; ++i)
+            pos += snprintf(szHex + pos, sizeof(szHex) - pos, "%02X ", resBuf[i]);
+        logDebug(kDebugFullIO, "X2Svbony241Pro: RX [%s]", szHex);
+    }
+
     // Verify response checksum
     uint8_t csExpected = calcChecksum(resBuf, nFullResLen - 1);
     if (resBuf[nFullResLen - 1] != csExpected)
     {
-        if (m_pLogger) m_pLogger->out("X2Svbony241Pro: checksum mismatch in response");
+        logDebug(kDebugErrors, "X2Svbony241Pro: checksum mismatch (got %02X expected %02X)",
+                 resBuf[nFullResLen - 1], csExpected);
         return ERR_CMDFAILED;
     }
 
     // Check device status byte (response[2] == 0xAA means device rejected the command)
     if (resBuf[2] == kStatusFailure)
     {
-        if (m_pLogger) m_pLogger->out("X2Svbony241Pro: device returned failure status (0xAA)");
+        logDebug(kDebugErrors, "X2Svbony241Pro: device returned failure status (0xAA)");
         return ERR_CMDFAILED;
     }
 
@@ -433,38 +629,53 @@ int X2Svbony241Pro::sendFrame(const uint8_t* pCmd, int nCmdLen,
 // readFrame
 //
 // Reads exactly nExpectedBytes from the serial port.
-// Retries every 1 ms up to kReadTimeoutMs total.
+// Retries every 1 ms up to kReadTimeoutMs total *elapsed* time.
+//
+// IMPORTANT: nElapsed counts every loop iteration (not just idle ones).
+// This is a hard wall-clock budget: even if the device sends a trickle of
+// bytes, we will never wait longer than kReadTimeoutMs milliseconds.
+// The previous implementation reset the idle counter on any byte received,
+// which allowed a chatty or misbehaving device to hold readFrame() open
+// indefinitely, locking the TheSkyX UI thread during establishLink().
 // ---------------------------------------------------------------------------
 int X2Svbony241Pro::readFrame(int nExpectedBytes, uint8_t* pBufOut)
 {
-    int nRead = 0;
-    int nIdle = 0;
+    int nRead    = 0;
+    int nElapsed = 0;   // total ms budget consumed (hard deadline)
 
-    while (nRead < nExpectedBytes && nIdle < kReadTimeoutMs)
+    while (nRead < nExpectedBytes && nElapsed < kReadTimeoutMs)
     {
         unsigned long nGot = 0;
         int nErr = m_pSerX->readFile(pBufOut + nRead,
                                      (unsigned long)(nExpectedBytes - nRead),
                                      nGot);
         if (nErr != SB_OK)
+        {
+            logDebug(kDebugErrors, "X2Svbony241Pro: readFile error %d", nErr);
             return nErr;
+        }
 
         if (nGot == 0)
         {
-            ++nIdle;
+            // No bytes yet — burn 1 ms of the hard budget and try again.
+            ++nElapsed;
             if (m_pSleeper) m_pSleeper->sleep(1);
         }
         else
         {
-            nRead += (int)nGot;
-            nIdle  = 0;     // reset idle counter on any progress
+            nRead    += (int)nGot;
+            // Count this iteration against the budget too: each readFile call
+            // costs roughly 1 ms even when it returns bytes.  This keeps the
+            // budget conservative and prevents an infinite trickle of bytes
+            // from extending the wait past kReadTimeoutMs.
+            ++nElapsed;
         }
     }
 
     if (nRead < nExpectedBytes)
     {
-        if (m_pLogger) m_pLogger->out("X2Svbony241Pro: read timeout");
-        return ERR_COMMTIMEOUT;
+        logDebug(kDebugErrors, "X2Svbony241Pro: read timeout (%d/%d bytes)", nRead, nExpectedBytes);
+        return ERR_TXTIMEOUT;
     }
 
     return SB_OK;
@@ -491,36 +702,70 @@ int X2Svbony241Pro::readFrame(int nExpectedBytes, uint8_t* pBufOut)
 // ---------------------------------------------------------------------------
 int X2Svbony241Pro::drainBootLog()
 {
-    if (m_pLogger)
-        m_pLogger->out("X2Svbony241Pro: waiting for ESP32 boot log to drain...");
+    // No mutex needed here: drainBootLog() is only ever called from
+    // establishLink() while m_bLinked is still false.  No other thread can
+    // reach sendFrame() (which also requires m_bLinked == true), so there is
+    // no concurrent access to the serial port at this point.  Taking the mutex
+    // here would hold it for up to ~1 second while sleeping, unnecessarily
+    // blocking any thread that tries to call isLinked() or other fast paths.
 
-    // Give the ESP32 time to complete its reset and emit the boot log
+    // Record the tick at which we enter drain so we can enforce a hard
+    // wall-clock cap (kBootDrainMaxMs).  This prevents a continuously chatty
+    // device (wrong port, modem, still-booting ESP32 with a very long boot log)
+    // from keeping the TSX UI thread blocked indefinitely.
+    int nDrainStartTick = m_pTickCount ? m_pTickCount->elapsed() : 0;
+
+    logDebug(kDebugCommands, "X2Svbony241Pro: drainBootLog start (initSleep=%d ms, maxMs=%d)",
+             kBootDrainInitSleepMs, kBootDrainMaxMs);
+
+    // Give the ESP32 time to complete its reset and begin emitting the boot log.
     if (m_pSleeper)
         m_pSleeper->sleep(kBootDrainInitSleepMs);
 
     uint8_t discard[64];
-    int nQuietRounds = 0;
-    const int kQuietTarget = 3;     // 3 consecutive empty reads → log is done
+    int nQuietRounds  = 0;
+    int nTotalRead    = 0;
+    const int kQuietTarget = 3;   // 3 consecutive empty reads → log is done
 
     for (int i = 0; i < kBootDrainRetries && nQuietRounds < kQuietTarget; ++i)
     {
+        // Hard wall-clock cap: stop reading even if we haven't hit kQuietTarget.
+        // This bounds the entire drain phase to kBootDrainMaxMs regardless of
+        // how much data the device sends, preventing an indefinite UI-thread stall
+        // when the wrong port is selected or the device has an unusually long boot log.
+        if (m_pTickCount)
+        {
+            int nElapsed = m_pTickCount->elapsed() - nDrainStartTick;
+            if (nElapsed >= kBootDrainMaxMs)
+            {
+                logDebug(kDebugErrors,
+                         "X2Svbony241Pro: drainBootLog wall-clock cap hit after %d ms "
+                         "(i=%d, quietRounds=%d, bytesRead=%d) — continuing to handshake",
+                         nElapsed, i, nQuietRounds, nTotalRead);
+                break;
+            }
+        }
+
         if (m_pSleeper)
             m_pSleeper->sleep(kBootDrainSleepMs);
 
         unsigned long nRead = 0;
         m_pSerX->readFile(discard, sizeof(discard), nRead);
+        nTotalRead += (int)nRead;
 
         if (nRead == 0)
             ++nQuietRounds;
         else
-            nQuietRounds = 0;
+            nQuietRounds = 0;   // reset quiet counter — still receiving boot bytes
     }
 
-    // Final flush of any residual bytes in the kernel buffer
+    // Final flush of any residual bytes in the kernel buffer.
     m_pSerX->purgeTxRx();
 
-    if (m_pLogger)
-        m_pLogger->out("X2Svbony241Pro: boot log drain complete");
+    int nTotalElapsed = m_pTickCount ? (m_pTickCount->elapsed() - nDrainStartTick) : -1;
+    logDebug(kDebugCommands,
+             "X2Svbony241Pro: drainBootLog done (elapsed=%d ms, bytesDiscarded=%d, quietRounds=%d)",
+             nTotalElapsed, nTotalRead, nQuietRounds);
 
     return SB_OK;
 }
@@ -547,6 +792,7 @@ int X2Svbony241Pro::drainBootLog()
 // ---------------------------------------------------------------------------
 int X2Svbony241Pro::cmdSetPort(uint8_t portIndex, uint8_t value)
 {
+    logDebug(kDebugCommands, "X2Svbony241Pro: cmdSetPort port=0x%02X val=0x%02X", portIndex, value);
     uint8_t cmd[3] = { 0x01, portIndex, value };
     uint8_t res[2] = { 0 };
     return sendFrame(cmd, 3, 2, res);
@@ -684,20 +930,77 @@ int X2Svbony241Pro::cmdGetState(uint8_t* pState10Out)
 // ---------------------------------------------------------------------------
 int X2Svbony241Pro::cmdPowerCycle()
 {
-    uint8_t res[2] = { 0 };
+    if (!m_bLinked || m_pSerX == NULL)
+        return ERR_COMMNOLINK;
 
-    // Step 1 — all off
+    // The power-cycle is a two-step atomic sequence: "all off", sleep 1 s,
+    // "all on".  We must hold the mutex across both steps and the sleep so
+    // that no other command can be injected between them (which would restart
+    // one or more outputs before the full cycle completes).
+    //
+    // This is the one place in the driver where the mutex is intentionally
+    // held while sleeping.  The sleep is short (1 s) and power-cycle is a
+    // user-initiated, infrequent operation, so blocking other callers is
+    // acceptable.
+    X2MutexLocker ml(m_pIOMutex);
+
+    // Re-check inside the lock (mirrors the pattern in sendFrame).
+    if (!m_bLinked || m_pSerX == NULL)
+        return ERR_COMMNOLINK;
+
+    // The two helper lambdas below duplicate a small subset of sendFrame's
+    // logic without re-locking the already-held mutex.  We build and send the
+    // frame manually, then read the response.
+
+    auto sendRaw = [&](const uint8_t* pCmd, int nCmdLen) -> int {
+        uint8_t frame[16];
+        int nFrameLen = 0;
+        buildFrame(pCmd, nCmdLen, frame, nFrameLen);
+
+        m_pSerX->purgeTxRx();
+
+        unsigned long nWritten = 0;
+        int nErr = m_pSerX->writeFile(frame, (unsigned long)nFrameLen, nWritten);
+        if (nErr != SB_OK) return nErr;
+        if ((int)nWritten != nFrameLen) return ERR_CMDFAILED;
+
+        if (m_pSleeper)
+            m_pSleeper->sleep(kPostWriteSleepMs);
+
+        // Response: header(1) + data_len(1) + status(1) + 2 payload + checksum(1)
+        const int kResLen = 6;
+        uint8_t res[kResLen] = {0};
+        nErr = readFrame(kResLen, res);
+        if (nErr != SB_OK) return nErr;
+
+        m_pSerX->purgeTxRx();
+
+        uint8_t csExpected = calcChecksum(res, kResLen - 1);
+        if (res[kResLen - 1] != csExpected) return ERR_CMDFAILED;
+        if (res[2] == kStatusFailure)       return ERR_CMDFAILED;
+        return SB_OK;
+    };
+
+    logDebug(kDebugCommands, "X2Svbony241Pro: cmdPowerCycle — all outputs off");
+
     uint8_t cmdOff[2] = { 0xFF, 0xFF };
-    int nErr = sendFrame(cmdOff, 2, 2, res);
+    int nErr = sendRaw(cmdOff, 2);
     if (nErr != SB_OK)
+    {
+        logDebug(kDebugErrors, "X2Svbony241Pro: cmdPowerCycle step 1 (off) failed (err %d)", nErr);
         return nErr;
+    }
 
     if (m_pSleeper)
         m_pSleeper->sleep(kPowerCycleSleepMs);
 
-    // Step 2 — all back on
+    logDebug(kDebugCommands, "X2Svbony241Pro: cmdPowerCycle — all outputs back on");
+
     uint8_t cmdOn[2] = { 0xFE, 0xFE };
-    return sendFrame(cmdOn, 2, 2, res);
+    nErr = sendRaw(cmdOn, 2);
+    if (nErr != SB_OK)
+        logDebug(kDebugErrors, "X2Svbony241Pro: cmdPowerCycle step 2 (on) failed (err %d)", nErr);
+    return nErr;
 }
 
 // ===========================================================================
@@ -975,14 +1278,17 @@ int X2Svbony241Pro::updateDewControl()
         return ERR_COMMNOLINK;
 
     // Rate-limit: skip if updated recently.
-    unsigned long now = m_pTickCount ? m_pTickCount->elapsed() : 0;
-    if (m_nLastDewUpdateTick != 0 && now != 0 &&
+    // elapsed() returns int (ms since TSX started).  Use int throughout to
+    // avoid signed/unsigned comparison pitfalls and to match the interface type.
+    int now = m_pTickCount ? m_pTickCount->elapsed() : 0;
+    if (m_nLastDewUpdateTick != 0 &&
         (now - m_nLastDewUpdateTick) < kDewUpdateIntervalMs)
         return SB_OK;
 
-    m_nLastDewUpdateTick = now;
-
     // --- Read sensors ---
+    // Stamp the update time AFTER a successful read, not before, so that a
+    // serial timeout (up to 600 ms per command) does not suppress the retry
+    // for the full 30-second interval.
     double tempC    = 0.0;
     double humidity = 0.0;
     int nErrT = cmdReadSHT40Temp(tempC);
@@ -995,21 +1301,21 @@ int X2Svbony241Pro::updateDewControl()
         m_dAmbientHumidityPct   = humidity;
         m_dDewPointC            = calcDewPoint(tempC, humidity);
         m_bSensorValid          = true;
+        // Only update the rate-limit timestamp on a successful read so that
+        // transient failures cause a retry on the next poll rather than waiting
+        // the full interval.
+        m_nLastDewUpdateTick    = now;
 
-        if (m_pLogger)
-        {
-            char szMsg[128];
-            snprintf(szMsg, sizeof(szMsg),
-                     "X2Svbony241Pro: dew update — ambient %.1f°C  RH %.0f%%  dewpoint %.1f°C",
-                     m_dAmbientTempC, m_dAmbientHumidityPct, m_dDewPointC);
-            m_pLogger->out(szMsg);
-        }
+        logDebug(kDebugCommands,
+                 "X2Svbony241Pro: dew update — ambient %.1f C  RH %.0f%%  dewpoint %.1f C",
+                 m_dAmbientTempC, m_dAmbientHumidityPct, m_dDewPointC);
     }
     else
     {
         m_bSensorValid = false;
-        if (m_pLogger)
-            m_pLogger->out("X2Svbony241Pro: dew update — sensor read failed, applying fallback");
+        logDebug(kDebugErrors,
+                 "X2Svbony241Pro: dew update — SHT40 read failed (errT=%d errH=%d), applying fallback",
+                 nErrT, nErrH);
     }
 
     // --- Apply auto PWM to each heater that is on and in auto mode ---
@@ -1022,13 +1328,8 @@ int X2Svbony241Pro::updateDewControl()
 
         int duty = calcAutoDutyPct(i);
 
-        if (m_pLogger)
-        {
-            char szMsg[80];
-            snprintf(szMsg, sizeof(szMsg),
-                     "X2Svbony241Pro: dew heater %d auto → %d%%", i + 1, duty);
-            m_pLogger->out(szMsg);
-        }
+        logDebug(kDebugCommands,
+                 "X2Svbony241Pro: dew heater %d auto duty → %d%%", i + 1, duty);
 
         uint8_t raw = static_cast<uint8_t>(
             floor(255.0 * static_cast<double>(duty) / 100.0 + 0.5));
@@ -1037,7 +1338,12 @@ int X2Svbony241Pro::updateDewControl()
         // Non-fatal: if the command fails we keep the cached state unchanged
         // and will retry on the next poll cycle.
         int nErr = cmdSetPort(kPortIndex[4 + i], raw);
-        if (nErr == SB_OK && duty == 0)
+        if (nErr != SB_OK)
+        {
+            logDebug(kDebugErrors,
+                     "X2Svbony241Pro: dew heater %d auto PWM command failed (err %d)", i + 1, nErr);
+        }
+        else if (duty == 0)
         {
             // Algorithm says fully off — reflect that in the circuit cache so
             // TheSkyX sees the heater as off.
@@ -1046,6 +1352,31 @@ int X2Svbony241Pro::updateDewControl()
     }
 
     return SB_OK;
+}
+
+// ---------------------------------------------------------------------------
+// saveDebugLevel / loadDebugLevel
+// ---------------------------------------------------------------------------
+void X2Svbony241Pro::saveDebugLevel()
+{
+    if (m_pIniUtil == NULL)
+        return;
+    char szKey[32];
+    snprintf(szKey, sizeof(szKey), "DebugLevel_%d", m_nInstanceIndex);
+    m_pIniUtil->writeInt(kIniSection, szKey, m_nDebugLevel);
+}
+
+void X2Svbony241Pro::loadDebugLevel()
+{
+    if (m_pIniUtil == NULL)
+        return;
+    char szKey[32];
+    snprintf(szKey, sizeof(szKey), "DebugLevel_%d", m_nInstanceIndex);
+    int nVal = kDebugOff;
+    nVal = m_pIniUtil->readInt(kIniSection, szKey, kDebugOff);
+    if (nVal < kDebugOff)    nVal = kDebugOff;
+    if (nVal > kDebugFullIO) nVal = kDebugFullIO;
+    m_nDebugLevel = nVal;
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,47 +1426,42 @@ void X2Svbony241Pro::loadDewConfig()
     for (int i = 0; i < 2; ++i)
     {
         snprintf(szKey, sizeof(szKey), "DewMode%d_%d", i, m_nInstanceIndex);
-        m_pIniUtil->readInt(kIniSection, szKey,
-                            static_cast<int>(kDefaultDewMode), nVal);
+        nVal = m_pIniUtil->readInt(kIniSection, szKey,
+                            static_cast<int>(kDefaultDewMode));
         m_eDewMode[i] = (nVal == static_cast<int>(DEW_MODE_AUTO))
                         ? DEW_MODE_AUTO : DEW_MODE_MANUAL;
 
         snprintf(szKey, sizeof(szKey), "DewFixedDuty%d_%d", i, m_nInstanceIndex);
-        m_pIniUtil->readInt(kIniSection, szKey, kDefaultDewDutyPct, nVal);
+        nVal = m_pIniUtil->readInt(kIniSection, szKey, kDefaultDewDutyPct);
         if (nVal < 0)   nVal = 0;
         if (nVal > 100) nVal = 100;
         m_nDewFixedDutyPct[i] = nVal;
 
         snprintf(szKey, sizeof(szKey), "DewAggressiveness%d_%d", i, m_nInstanceIndex);
-        m_pIniUtil->readInt(kIniSection, szKey, kDefaultDewAggressiveness, nVal);
+        nVal = m_pIniUtil->readInt(kIniSection, szKey, kDefaultDewAggressiveness);
         if (nVal < 1)  nVal = 1;
         if (nVal > 10) nVal = 10;
         m_nDewAggressiveness[i] = nVal;
 
         snprintf(szKey, sizeof(szKey), "DewFallback%d_%d", i, m_nInstanceIndex);
-        m_pIniUtil->readInt(kIniSection, szKey,
-                            static_cast<int>(kDefaultDewFallback), nVal);
+        nVal = m_pIniUtil->readInt(kIniSection, szKey,
+                            static_cast<int>(kDefaultDewFallback));
         m_eDewFallback[i] = (nVal == static_cast<int>(DEW_FALLBACK_ON))
                             ? DEW_FALLBACK_ON : DEW_FALLBACK_OFF;
     }
 
-    if (m_pLogger)
-    {
-        char szMsg[160];
-        snprintf(szMsg, sizeof(szMsg),
-                 "X2Svbony241Pro: dew config loaded — "
-                 "H1 mode=%s agg=%d fallback=%s fixed=%d%%  "
-                 "H2 mode=%s agg=%d fallback=%s fixed=%d%%",
-                 m_eDewMode[0] == DEW_MODE_AUTO ? "AUTO" : "MANUAL",
-                 m_nDewAggressiveness[0],
-                 m_eDewFallback[0] == DEW_FALLBACK_ON ? "ON" : "OFF",
-                 m_nDewFixedDutyPct[0],
-                 m_eDewMode[1] == DEW_MODE_AUTO ? "AUTO" : "MANUAL",
-                 m_nDewAggressiveness[1],
-                 m_eDewFallback[1] == DEW_FALLBACK_ON ? "ON" : "OFF",
-                 m_nDewFixedDutyPct[1]);
-        m_pLogger->out(szMsg);
-    }
+    logDebug(kDebugCommands,
+             "X2Svbony241Pro: dew config loaded — "
+             "H1 mode=%s agg=%d fallback=%s fixed=%d%%  "
+             "H2 mode=%s agg=%d fallback=%s fixed=%d%%",
+             m_eDewMode[0] == DEW_MODE_AUTO ? "AUTO" : "MANUAL",
+             m_nDewAggressiveness[0],
+             m_eDewFallback[0] == DEW_FALLBACK_ON ? "ON" : "OFF",
+             m_nDewFixedDutyPct[0],
+             m_eDewMode[1] == DEW_MODE_AUTO ? "AUTO" : "MANUAL",
+             m_nDewAggressiveness[1],
+             m_eDewFallback[1] == DEW_FALLBACK_ON ? "ON" : "OFF",
+             m_nDewFixedDutyPct[1]);
 }
 
 // ===========================================================================
@@ -1215,27 +1541,26 @@ int X2Svbony241Pro::execModalSettingsDialog()
             uiex->setText("label_dewPoint", szBuf);
         }
 
-        // DS18B20 and INA219 — attempt a quick live read if linked
+        // Populate status labels from cache only — no serial I/O before exec().
+        // The dialog timer (on_timer uiEvent) refreshes these values while the
+        // dialog is open.  Performing serial reads here would block the calling
+        // thread for up to ~600 ms per command (100 ms post-write sleep + 500 ms
+        // read timeout) before the dialog even appears, and could contend with
+        // circuitState() for the I/O mutex on a concurrent TSX polling thread.
         if (m_bLinked)
         {
             char szBuf[64];
-            double val = 0.0;
 
-            if (cmdReadDS18B20Temp(val) == SB_OK)
-            {
-                snprintf(szBuf, sizeof(szBuf), "%.1f °C", val);
-                uiex->setText("label_lensTemp", szBuf);
-            }
-            if (cmdReadVoltage(val) == SB_OK)
-            {
-                snprintf(szBuf, sizeof(szBuf), "%.2f V", val);
-                uiex->setText("label_voltage", szBuf);
-            }
-            if (cmdReadCurrent(val) == SB_OK)
-            {
-                snprintf(szBuf, sizeof(szBuf), "%.3f A", val);
-                uiex->setText("label_current", szBuf);
-            }
+            // INA219 — from cache (updated on the last TSX poll cycle)
+            snprintf(szBuf, sizeof(szBuf), "%.2f V", m_dVoltageV);
+            uiex->setText("label_voltage", szBuf);
+
+            snprintf(szBuf, sizeof(szBuf), "%.3f A", m_dCurrentA);
+            uiex->setText("label_current", szBuf);
+
+            // Lens temperature is not cached between sessions; show dash until
+            // the next dew-control poll populates it via the timer refresh.
+            uiex->setText("label_lensTemp", "—");
 
             // Port states from cache
             const char* kDCLabels[] = { "label_dc1","label_dc2","label_dc3","label_dc4" };
@@ -1254,6 +1579,9 @@ int X2Svbony241Pro::execModalSettingsDialog()
                 uiex->setText("label_regulated", "OFF");
             }
         }
+
+        // --- Debug level ---
+        uiex->setCurrentIndex("comboBox_debugLevel", m_nDebugLevel);
 
         // --- Dew heater settings ---
         for (int i = 0; i < 2; ++i)
@@ -1315,6 +1643,13 @@ int X2Svbony241Pro::execModalSettingsDialog()
                 m_nDewAggressiveness[i] = nAgg;
             }
 
+            // Debug level
+            int nDbg = uiex->currentIndex("comboBox_debugLevel");
+            if (nDbg < kDebugOff)    nDbg = kDebugOff;
+            if (nDbg > kDebugFullIO) nDbg = kDebugFullIO;
+            m_nDebugLevel = nDbg;
+
+            saveDebugLevel();
             saveDewConfig();
 
             // Force an immediate auto-control update so the new settings take effect now
@@ -1346,26 +1681,19 @@ void X2Svbony241Pro::uiEvent(X2GUIExchangeInterface* uiex, const char* pszEvent)
     if (uiex == NULL || pszEvent == NULL)
         return;
 
-    // ── Timer tick: refresh live data ────────────────────────────────────
+    // ── Timer tick: refresh UI from cached values only (no serial I/O) ───
+    // Serial reads happen on TSX polling threads (circuitState / setCircuitState).
+    // Touching the port here would block the TSX UI thread.
     if (!strcmp(pszEvent, "on_timer"))
     {
+        uiex->setText("label_connStatus", m_bLinked ? "Connected" : "Not connected");
+
         if (!m_bLinked)
-        {
-            uiex->setText("label_connStatus", "Not connected");
             return;
-        }
 
-        // Refresh port state cache (single fast command)
-        queryAllCircuitStates();
-
-        // Trigger sensor read at the normal auto-dew rate (30 s throttle)
-        updateDewControl();
-
-        // Update connection / sensor status badges
-        uiex->setText("label_connStatus", "Connected");
         uiex->setText("label_sensorStatus", m_bSensorValid ? "OK" : "Read error");
 
-        // Environmental sensor labels
+        // Environmental sensor labels — from cache
         char szBuf[64];
         if (m_bSensorValid)
         {
@@ -1385,27 +1713,17 @@ void X2Svbony241Pro::uiEvent(X2GUIExchangeInterface* uiex, const char* pszEvent)
             uiex->setText("label_dewPoint",    "—");
         }
 
-        // DS18B20 — read live (one command, ~200ms with sleep)
-        double val = 0.0;
-        if (cmdReadDS18B20Temp(val) == SB_OK)
-        {
-            snprintf(szBuf, sizeof(szBuf), "%.1f °C", val);
-            uiex->setText("label_lensTemp", szBuf);
-        }
+        // INA219 — from cache
+        snprintf(szBuf, sizeof(szBuf), "%.2f V", m_dVoltageV);
+        uiex->setText("label_voltage", szBuf);
+        snprintf(szBuf, sizeof(szBuf), "%.3f A", m_dCurrentA);
+        uiex->setText("label_current", szBuf);
 
-        // INA219 voltage and current
-        if (cmdReadVoltage(val) == SB_OK)
-        {
-            snprintf(szBuf, sizeof(szBuf), "%.2f V", val);
-            uiex->setText("label_voltage", szBuf);
-        }
-        if (cmdReadCurrent(val) == SB_OK)
-        {
-            snprintf(szBuf, sizeof(szBuf), "%.3f A", val);
-            uiex->setText("label_current", szBuf);
-        }
+        // Lens temp — not cached between sessions; show "—" until next poll
+        // (the execModalSettingsDialog initial read and TSX polling update this)
+        uiex->setText("label_lensTemp", "—");
 
-        // DC port on/off states
+        // DC port on/off states — from cache
         const char* kDCLabels[] = { "label_dc1","label_dc2","label_dc3","label_dc4" };
         for (int i = 0; i < 4; ++i)
             uiex->setText(kDCLabels[i], m_bCircuitState[i] ? "ON" : "OFF");
@@ -1422,7 +1740,7 @@ void X2Svbony241Pro::uiEvent(X2GUIExchangeInterface* uiex, const char* pszEvent)
             uiex->setText("label_regulated", "OFF");
         }
 
-        // Auto dew computed duty labels (reflect current algorithm output)
+        // Auto dew computed duty labels — from cache (pure computation, no I/O)
         for (int i = 0; i < 2; ++i)
         {
             const char* autoDutyLabel = (i == 0) ? "label_dew1AutoDuty" : "label_dew2AutoDuty";
@@ -1435,7 +1753,6 @@ void X2Svbony241Pro::uiEvent(X2GUIExchangeInterface* uiex, const char* pszEvent)
                 }
                 else
                 {
-                    // Show fallback description so the user knows what the driver is doing
                     uiex->setText(autoDutyLabel,
                         (m_eDewFallback[i] == DEW_FALLBACK_ON) ? "fallback ON" : "fallback OFF");
                 }

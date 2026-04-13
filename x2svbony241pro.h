@@ -1,17 +1,22 @@
 #pragma once
 
-#include "../X2-Examples/licensedinterfaces/powercontroldriverinterface.h"
-#include "../X2-Examples/licensedinterfaces/serxinterface.h"
-#include "../X2-Examples/licensedinterfaces/theskyxfacadefordriversinterface.h"
-#include "../X2-Examples/licensedinterfaces/sleeperinterface.h"
-#include "../X2-Examples/licensedinterfaces/basiciniutilinterface.h"
-#include "../X2-Examples/licensedinterfaces/loggerinterface.h"
-#include "../X2-Examples/licensedinterfaces/mutexinterface.h"
-#include "../X2-Examples/licensedinterfaces/tickcountinterface.h"
-#include "../X2-Examples/licensedinterfaces/modalsettingsdialoginterface.h"
-#include "../X2-Examples/licensedinterfaces/x2guiinterface.h"
+#include "licensedinterfaces/sberrorx.h"
+#include "licensedinterfaces/basicstringinterface.h"
+#include "licensedinterfaces/powercontroldriverinterface.h"
+#include "licensedinterfaces/serxinterface.h"
+#include "licensedinterfaces/theskyxfacadefordriversinterface.h"
+#include "licensedinterfaces/sleeperinterface.h"
+#include "licensedinterfaces/basiciniutilinterface.h"
+#include "licensedinterfaces/loggerinterface.h"
+#include "licensedinterfaces/mutexinterface.h"
+#include "licensedinterfaces/tickcountinterface.h"
+#include "licensedinterfaces/modalsettingsdialoginterface.h"
+#include "licensedinterfaces/x2guiinterface.h"
+#include "licensedinterfaces/circuitlabels.h"
+#include "licensedinterfaces/serialportparams2interface.h"
 
 #include <stdint.h>
+#include <string>
 
 // ---------------------------------------------------------------------------
 // Dew-heater operating mode (per heater)
@@ -57,6 +62,8 @@ enum DewFallback
 class X2Svbony241Pro : public PowerControlDriverInterface
                      , public ModalSettingsDialogInterface
                      , public X2GUIEventInterface
+                     , public CircuitLabelsInterface
+                     , public SerialPortParams2Interface
 {
 public:
     X2Svbony241Pro(
@@ -75,7 +82,7 @@ public:
     // -----------------------------------------------------------------------
     // DriverRootInterface
     // -----------------------------------------------------------------------
-    virtual DeviceType  deviceType()                                        { return PowerControlBox; }
+    virtual DeviceType  deviceType()                                        { return DriverRootInterface::DT_POWERCONTROL; }
     virtual int         queryAbstraction(const char* pszName, void** ppVal);
 
     // -----------------------------------------------------------------------
@@ -107,6 +114,23 @@ public:
     virtual int         circuitName(const int& nIndex, BasicStringInterface& str);
     virtual int         circuitState(const int& nIndex, bool& bOn);
     virtual int         setCircuitState(const int& nIndex, const bool& bOn);
+
+    // -----------------------------------------------------------------------
+    // CircuitLabelsInterface
+    // -----------------------------------------------------------------------
+    virtual int         circuitLabel(const int& nZeroBasedIndex, BasicStringInterface& str);
+
+    // -----------------------------------------------------------------------
+    // SerialPortParams2Interface
+    // -----------------------------------------------------------------------
+    virtual void            portName(BasicStringInterface& str) const;
+    virtual void            setPortName(const char* szPort);
+    virtual unsigned int    baudRate()       const   { return 115200; }
+    virtual void            setBaudRate(unsigned int)       {}
+    virtual bool            isBaudRateFixed() const         { return true; }
+    virtual SerXInterface::Parity parity()  const   { return SerXInterface::B_NOPARITY; }
+    virtual void            setParity(const SerXInterface::Parity&) {}
+    virtual bool            isParityFixed()  const          { return true; }
 
     // -----------------------------------------------------------------------
     // ModalSettingsDialogInterface
@@ -255,8 +279,20 @@ private:
     MutexInterface*                     m_pIOMutex;
     TickCountInterface*                 m_pTickCount;
 
+    // Persist and reload debug level from ini (0=Off,1=Errors,2=Cmds,3=FullIO)
+    void            saveDebugLevel();
+    void            loadDebugLevel();
+
+    // Log helper: only writes if m_nDebugLevel >= minLevel.
+    // minLevel: 1=Errors only, 2=Commands, 3=Full I/O
+    void            logDebug(int minLevel, const char* fmt, ...) const;
+
+    // Helper used by portName() and establishLink()
+    void        getPortName(std::string& sPortName) const;
+
     int     m_nInstanceIndex;
     bool    m_bLinked;
+    int     m_nDebugLevel;      // 0=Off, 1=Errors, 2=Commands, 3=Full I/O
 
     // Cached on/off state for each X2 circuit
     bool    m_bCircuitState[X2_NUM_CIRCUITS];
@@ -283,6 +319,8 @@ private:
     double          m_dDewPointC;
     bool            m_bSensorValid;          // false after any sensor read failure
 
-    // TickCountInterface timestamp of last auto-dew sensor update
-    unsigned long   m_nLastDewUpdateTick;
+    // TickCountInterface timestamp of last successful auto-dew sensor update.
+    // Stored as int to match the return type of TickCountInterface::elapsed().
+    // Zero means "never updated" (forces the first call to run immediately).
+    int             m_nLastDewUpdateTick;
 };
