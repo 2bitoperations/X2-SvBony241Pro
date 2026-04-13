@@ -114,40 +114,37 @@ After restarting, the **SVBony SV241 Pro** entry will appear in the
 
 ---
 
-## TODO — USB Serial Protocol
+## Protocol
 
-The USB serial command protocol used by the SVBony SV241 Pro has **not yet
-been documented or reverse-engineered** at the time this driver was created.
+The USB serial protocol for the SV241 Pro has been documented from the INDI
+driver source. See **[PROTOCOL.md](PROTOCOL.md)** for the full specification,
+including frame structure, all command/response pairs, sensor decoding, and
+the ESP32 boot sequence that must be handled on connect.
 
-The following methods in `x2svbony241pro.cpp` contain `TODO` stub comments
-where the real device commands must be inserted once the protocol is known:
+Key facts:
+- 115200 baud, 8N1, no flow control
+- Binary framing: `0x24` header, length byte, payload, checksum
+- ESP32 resets on RTS/DTR clear — boot log must be drained before binary commands
 
-| Method                  | What needs to be filled in                        |
-|-------------------------|---------------------------------------------------|
-| `queryAllCircuitStates` | Send a status-query command; parse the response   |
-| `setCircuitState`       | Send a switch-on/off command for the given circuit |
-| `deviceInfoFirmwareVersion` | Issue a firmware-version query               |
+---
 
-### How to obtain the protocol
+## Attribution
 
-Recommended approaches in order of preference:
+The protocol documentation in `PROTOCOL.md` was derived from the INDI driver
+for the SVBony SV241 Pro, authored by **Tetsuya Kakura** and published under
+the **GNU General Public License v2.0 or later**.
 
-1. **Contact SVBony** — request protocol documentation or an SDK from
-   `support@svbony.com`.
-2. **Sniff the USB traffic** — use Wireshark with the USBPcap driver (Windows)
-   or `usbmon` (Linux) while operating the device with the official SVBony
-   software to capture and analyse the commands exchanged.
-3. **Inspect official software** — if SVBony provides open-source or
-   decompilable software, the command strings may be extractable directly.
+- **INDI Project:** https://github.com/indilib/indi
+- **Driver source:** `drivers/power/svbony_powerbox.cpp` / `svbony_powerbox.h`
+- **License:** GPL-2.0+
 
-Once the protocol is known, update `sendCommand`, `readResponse`,
-`queryAllCircuitStates`, and `setCircuitState` in `x2svbony241pro.cpp`
-and remove the stub log messages.
+This X2 driver is an independent implementation and does not incorporate any
+GPL-licensed code; it uses only the protocol specification derived from study
+of the INDI driver.
 
 ---
 
 ## License
 
 This driver scaffold is provided as-is for the astronomy community.
-No warranty is expressed or implied.  Contributions and protocol
-documentation are welcome via pull request or issue.
+No warranty is expressed or implied.  Contributions welcome via pull request.
