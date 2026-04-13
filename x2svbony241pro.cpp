@@ -692,8 +692,16 @@ int X2Svbony241Pro::readFrame(int nExpectedBytes, uint8_t* pBufOut)
 // Arduino/ESP32 auto-reset via USB-CDC DTR/RTS).  It emits ~10 lines of
 // boot text at 115200 before the firmware accepts binary commands.
 //
-// Strategy: wait 500 ms for the boot to start, then read and discard until
-// we see kBootDrainRetries consecutive quiet reads (no bytes arriving).
+// Strategy: wait kBootDrainInitSleepMs for the boot to start, then read and
+// discard until we see kQuietTarget consecutive quiet reads (no bytes
+// arriving), or until the hard wall-clock cap kBootDrainMaxMs elapses.
+//
+// The wall-clock cap is the critical safety net: without it a continuously
+// chatty device (wrong port, modem, still-booting device with a long log)
+// would hold the TSX UI thread blocked for up to
+//   kBootDrainInitSleepMs + kBootDrainRetries × kBootDrainSleepMs
+// milliseconds, making TheSkyX appear frozen.  The cap ensures the drain
+// phase never takes more than kBootDrainMaxMs ms in total.
 //
 // Note: the INDI driver uses ioctl(TIOCMSET) to explicitly clear RTS and DTR
 // before draining.  SerXInterface does not expose ioctl, so we rely on the

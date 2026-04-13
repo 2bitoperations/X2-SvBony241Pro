@@ -1,0 +1,119 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Matrix build: Linux, macOS, Windows
+  # Runs on every push to main and every PR.
+  # -----------------------------------------------------------------------
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            artifact: libx2svbony241pro.so
+
+          - os: macos-latest
+            platform: macos
+            artifact: libx2svbony241pro.dylib
+
+          - os: windows-latest
+            platform: windows
+            artifact: libx2svbony241pro.dll
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needed for git rev-list --count
+
+      - name: Compute build number
+        id: ver
+        shell: bash
+        run: echo "n=$(git rev-list --count HEAD)" >> $GITHUB_OUTPUT
+
+      # ---- Linux / macOS ----
+      - name: Build (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: make BUILD_NUMBER=${{ steps.ver.outputs.n }}
+
+      # ---- Windows: MSYS2 + MinGW64 ----
+      - name: Setup MSYS2
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            make
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: make BUILD_NUMBER=${{ steps.ver.outputs.n }}
+
+      # ---- Package ----
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          cp "${{ matrix.artifact }}" dist/
+          cp sv241pro.ui dist/
+          cp "powercontrollist Svbony.txt" dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sv241pro-plugin-${{ matrix.platform }}
+          path: dist/
+
+  # -----------------------------------------------------------------------
+  # Auto-release on every push to main.
+  # Tag is v<major>.<git-commit-count> — always incrementing, no manual tagging.
+  # -----------------------------------------------------------------------
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version tag
+        id: ver
+        run: |
+          N=$(git rev-list --count HEAD)
+          echo "tag=v1.${N}" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Zip platform bundles
+        run: |
+          cd artifacts
+          for dir in */; do
+            zip -r "${dir%/}.zip" "$dir"
+          done
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          files: artifacts/*.zip
+          generate_release_notes: true
