@@ -45,7 +45,7 @@ The driver communicates with the SV241 Pro over its USB virtual serial port
 | `main.cpp`                    | `sbPlugInName2` and `sbPlugInFactory2` implementations |
 | `x2svbony241pro.h`            | Driver class declaration                             |
 | `x2svbony241pro.cpp`          | Driver class implementation                          |
-| `CMakeLists.txt`              | CMake build script                                   |
+| `Makefile`                    | Build and install script                             |
 | `powercontrollist Svbony.txt` | TheSkyX hardware registration file                  |
 
 ---
@@ -54,8 +54,7 @@ The driver communicates with the SV241 Pro over its USB virtual serial port
 
 ### Prerequisites
 
-- CMake 3.10 or later
-- A C++11-capable compiler (GCC, Clang, MSVC)
+- A C++11-capable compiler (GCC or Clang)
 - The TheSkyX X2 SDK (licensed interfaces) checked out at `../X2-Examples/`
   relative to this directory.  The canonical location is:
   `https://github.com/theskyxdeveloper/X2-Examples`
@@ -64,19 +63,19 @@ The driver communicates with the SV241 Pro over its USB virtual serial port
 
 ```bash
 # From the repository root
-mkdir build
-cd build
-cmake ..
-cmake --build .
+make clean && make install
 ```
 
-The output library will be placed in `build/` as:
+`make install` builds the library and copies it (along with the UI file and
+hardware registration text) into your local TheSkyX installation.  Restart
+TheSkyX after installing.
+
+The output library is placed in the repo root as:
 
 | Platform | File                      |
 |----------|---------------------------|
 | Linux    | `libx2svbony241pro.so`    |
 | macOS    | `libx2svbony241pro.dylib` |
-| Windows  | `x2svbony241pro.dll`      |
 
 ---
 

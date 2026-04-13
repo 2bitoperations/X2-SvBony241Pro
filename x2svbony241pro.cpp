@@ -13,10 +13,9 @@
 #  include <unistd.h>
 #  include <sys/ioctl.h>
 #  include <termios.h>
+#  include <poll.h>
 #endif
 
-// Forward declaration — defined near drainBootLog() below
-static void resetEsp32ViaDtr(const char* pszPort, int assertMs, int bootWaitMs);
 
 // ---------------------------------------------------------------------------
 // Circuit name table — keep in sync with X2 circuit index definitions
@@ -76,7 +75,9 @@ static const double  kDefaultRegulatedVoltageV  = 12.0;  // 12 V
 static const int           kDefaultDewAggressiveness  = 5;           // mid-range
 static const DewHeaterMode kDefaultDewMode             = DEW_MODE_MANUAL;
 static const DewFallback   kDefaultDewFallback         = DEW_FALLBACK_ON;
-static const int           kDewUpdateIntervalMs        = 30000;       // 30 s between sensor reads
+static const int           kDewUpdateIntervalMs        = 30000;       // 30 s background sensor poll rate
+static const int           kDialogPollIntervalMs       = 5000;        //  5 s poll rate while dialog is open
+static const int           kSensorWarmupMs             = 15000; // ESP32 needs ~15s after reset to init sensors
 
 // Ini section key for persisted dew settings
 static const char* kIniSection = "SV241Pro";
@@ -123,7 +124,11 @@ X2Svbony241Pro::X2Svbony241Pro(
     , m_dAmbientHumidityPct (0.0)
     , m_dDewPointC          (0.0)
     , m_bSensorValid        (false)
-    , m_nLastDewUpdateTick  (0)
+    , m_dLensTempC          (0.0)
+    , m_bLensTempValid      (false)
+    , m_nLastDewUpdateTick      (0)
+    , m_nLastDialogSensorTick  (0)
+    , m_nResetTimeTick          (0)
 {
     (void)pszDisplayName;   // display name is managed by TheSkyX
 
@@ -328,73 +333,150 @@ int X2Svbony241Pro::establishLink()
 
     logDebug(kDebugErrors, "X2Svbony241Pro: establishLink start (port=%s)", sPortName.c_str());
 
-    int nErr = m_pSerX->open(sPortName.c_str(), kBaudRate, SerXInterface::B_NOPARITY, 0);
-    if (nErr != SB_OK)
-    {
-        logDebug(kDebugErrors, "X2Svbony241Pro: serial port open failed (err %d)", nErr);
-        return nErr;
-    }
-
-    // Keep m_bLinked = false throughout the drain+handshake window.  TSX
-    // polling threads check m_bLinked before entering sendFrame; keeping it
-    // false here ensures they return ERR_COMMNOLINK rather than racing with
-    // drainBootLog() or the handshake command on the freshly-opened port.
-
-    // Restore persisted configuration before touching the device.
+    // Keep m_bLinked = false throughout the drain+handshake window.
     loadDebugLevel();
     loadDewConfig();
 
     // -----------------------------------------------------------------------
-    // Handshake strategy: try once without disturbing the device.
+    // Connection strategy for CH341 + ESP32
     //
-    // If the ESP32 is already running (e.g. second connect, or the port was
-    // not reset by SerXInterface::open()), it will respond immediately and we
-    // avoid an unnecessary reset that would briefly cut power to all outputs.
+    // The Linux ch341 driver asserts DTR whenever tcsetattr() configures the
+    // port (which SerXInterface::open() triggers internally).  DTR asserted →
+    // CH341 pulls ESP32 EN low → ESP32 held in reset → never responds.
     //
-    // If the first attempt times out — typically because the CH341 left DTR
-    // asserted and the ESP32 is stuck in reset — we toggle DTR to force a
-    // clean reboot, drain the resulting boot log, and try once more.
+    // To work around this we open a private "control" fd BEFORE calling
+    // m_pSerX->open().  Because TIOCEXCL is only set by TSX after its open(),
+    // our fd is guaranteed to open successfully.  We:
+    //
+    //   1. Assert DTR on the ctrl fd  (ESP32 goes into reset — harmless)
+    //   2. Call m_pSerX->open()       (TSX configures the port; device still
+    //                                  in reset so any DTR glitch is a no-op)
+    //   3. Release DTR on the ctrl fd (ESP32 starts booting; boot log flows
+    //                                  into TSX's RX buffer)
+    //   4. drainBootLog()             (consumes boot text through SerXInterface)
+    //   5. Handshake
+    //   6. Close ctrl fd with HUPCL cleared (DTR stays high; ESP32 keeps running)
+    //
+    // Attempt 1 tries without a reset first.  If the device is already running
+    // (e.g. re-connect without unplugging) it responds immediately and we skip
+    // the boot cycle entirely, avoiding any disruption to powered outputs.
     // -----------------------------------------------------------------------
 
-    // Attempt 1: device already running, no reset needed.
-    m_bLinked = true;
-    uint8_t state10[10] = {0};
-    nErr = cmdGetState(state10);
-    if (nErr == SB_OK)
+    // Open the control fd while the port is free (before TSX's TIOCEXCL).
+    int nCtrlFd = -1;
+#if defined(SB_LINUX_BUILD) || defined(SB_MACOSX_BUILD)
+    nCtrlFd = ::open(sPortName.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (nCtrlFd >= 0)
     {
-        // Device responded immediately — we're done.
-        logDebug(kDebugErrors, "X2Svbony241Pro: handshake OK on first attempt (no reset needed)");
+        struct termios tio;
+        if (::tcgetattr(nCtrlFd, &tio) == 0)
+        {
+            tio.c_cflag &= ~HUPCL;   // don't drop DTR on close
+            tio.c_cflag |=  CLOCAL;  // ignore carrier detect
+            ::tcsetattr(nCtrlFd, TCSANOW, &tio);
+        }
+        logDebug(kDebugCommands, "X2Svbony241Pro: ctrl fd opened (fd=%d)", nCtrlFd);
     }
     else
     {
-        // First attempt failed.  Reset the ESP32 via DTR and retry.
+        logDebug(kDebugErrors, "X2Svbony241Pro: ctrl fd open failed (errno=%d) — no DTR control", errno);
+    }
+#endif
+
+    // Helper lambdas to set DTR+RTS via the control fd.
+    // The ESP32 auto-reset circuit on the SV241 Pro is cross-coupled:
+    //   DTR → EN pin (active-low reset)
+    //   RTS → GPIO0 pin (boot-mode select)
+    // Both lines must be asserted together to pull EN low cleanly;
+    // leaving RTS high (as TSX sets it) prevents DTR from fully
+    // resetting the chip.  This replicates the exact esptool sequence.
+#if defined(SB_LINUX_BUILD) || defined(SB_MACOSX_BUILD)
+    auto setDtrRts = [&](bool bAssert) {
+        if (nCtrlFd < 0) return;
+        int modem = 0;
+        ::ioctl(nCtrlFd, TIOCMGET, &modem);
+        if (bAssert) { modem |=  TIOCM_DTR; modem |=  TIOCM_RTS; }
+        else         { modem &= ~TIOCM_DTR; modem &= ~TIOCM_RTS; }
+        ::ioctl(nCtrlFd, TIOCMSET, &modem);
+    };
+    auto closeCtrlFd = [&]() {
+        if (nCtrlFd >= 0) { ::close(nCtrlFd); nCtrlFd = -1; }
+    };
+#else
+    auto setDtrRts   = [&](bool) {};
+    auto closeCtrlFd = [&]() {};
+#endif
+
+    // --- Attempt 1: try without reset ---
+    // Leave DTR in its current state and see if the device is already alive.
+    int nErr = m_pSerX->open(sPortName.c_str(), kBaudRate, SerXInterface::B_NOPARITY, 0);
+    if (nErr != SB_OK)
+    {
+        logDebug(kDebugErrors, "X2Svbony241Pro: serial port open failed (err %d)", nErr);
+        closeCtrlFd();
+        return nErr;
+    }
+
+    // TSX's open() may have left RTS asserted (or DTR in an unknown state).
+    // Release both now so the ESP32 is free to run if it was held in reset.
+    setDtrRts(false);
+
+    m_bLinked = true;
+    uint8_t state10[10] = {0};
+    nErr = cmdGetState(state10);
+
+    if (nErr == SB_OK)
+    {
+        logDebug(kDebugErrors, "X2Svbony241Pro: handshake OK on first attempt");
+        closeCtrlFd();
+    }
+    else
+    {
+        // First attempt failed.
         int nFirstFailMs = m_pTickCount ? (m_pTickCount->elapsed() - nLinkStartTick) : -1;
         logDebug(kDebugErrors,
-                 "X2Svbony241Pro: first handshake attempt failed at +%d ms (err %d) "
-                 "— resetting ESP32 via DTR and retrying",
+                 "X2Svbony241Pro: first attempt failed at +%d ms (err %d) — doing ESP32 reset",
                  nFirstFailMs, nErr);
+        m_bLinked = false;
 
-        m_bLinked = false;  // keep guard down while we reset + drain
+        // Assert DTR+RTS together → ESP32 in reset (200ms), then release both.
+        // The SV241 Pro uses the standard ESP32 auto-reset circuit:
+        //   DTR → EN (active-low reset), RTS → GPIO0 (boot-mode select).
+        // The transistors are cross-coupled so both lines must be asserted
+        // to pull EN cleanly low.  Releasing both lets the chip boot normally.
+        setDtrRts(true);
 
-        // Toggle DTR: assert (ESP32 EN LOW = reset) then release (EN HIGH = boot).
-        resetEsp32ViaDtr(sPortName.c_str(), 200 /*assertMs*/, 100 /*preBootMs*/);
+        struct timespec ts200 = { 0, 200000000L };
+        ::nanosleep(&ts200, NULL);
 
-        // Drain the boot log before sending binary commands.
+        setDtrRts(false);
+
+        // Record the reset time so updateDewControl() can defer sensor reads
+        // until the INA219 and SHT40 are ready (~15 s after reset).
+        m_nResetTimeTick = m_pTickCount ? m_pTickCount->elapsed() : 0;
+
+        logDebug(kDebugErrors, "X2Svbony241Pro: DTR+RTS released — draining boot log");
+
+        // Drain the boot log that will appear in TSX's RX buffer as the ESP32 boots.
         (void)drainBootLog();
 
         int nAfterDrainMs = m_pTickCount ? (m_pTickCount->elapsed() - nLinkStartTick) : -1;
         logDebug(kDebugErrors,
-                 "X2Svbony241Pro: drain phase done at +%d ms — starting handshake (attempt 2)",
+                 "X2Svbony241Pro: drain done at +%d ms — handshake attempt 2",
                  nAfterDrainMs);
 
         m_bLinked = true;
         memset(state10, 0, sizeof(state10));
         nErr = cmdGetState(state10);
+
+        // Done with the ctrl fd regardless of handshake outcome.
+        closeCtrlFd();
+
         if (nErr != SB_OK)
         {
             int nFailMs = m_pTickCount ? (m_pTickCount->elapsed() - nLinkStartTick) : -1;
             logDebug(kDebugErrors,
-                     "X2Svbony241Pro: handshake failed after reset at +%d ms (err %d) — closing port",
+                     "X2Svbony241Pro: handshake failed after reset at +%d ms (err %d) — closing",
                      nFailMs, nErr);
             m_bLinked = false;
             m_pSerX->close();
@@ -477,16 +559,11 @@ int X2Svbony241Pro::circuitState(const int& nIndex, bool& bOn)
     if (nIndex < 0 || nIndex >= X2_NUM_CIRCUITS)
         return ERR_INDEX_OUT_OF_RANGE;
 
-    // Drive the auto-dew control loop on every poll call, not just when TSX
-    // happens to query a dew-heater circuit.  TSX may poll all eight circuits
-    // in sequence; we want the update to fire as long as at least one heater is
-    // in AUTO mode and is on, regardless of which circuit index triggered this.
-    // updateDewControl() is itself rate-limited to kDewUpdateIntervalMs and
-    // returns immediately when the interval has not elapsed.
-    bool bAnyAutoDewActive = (m_eDewMode[0] == DEW_MODE_AUTO && m_bCircuitState[4])
-                           || (m_eDewMode[1] == DEW_MODE_AUTO && m_bCircuitState[5]);
-    if (bAnyAutoDewActive)
-        updateDewControl();
+    // Drive the sensor update loop on every poll call.
+    // updateDewControl() reads all sensors (SHT40, INA219, DS18B20) and applies
+    // auto-PWM to any heater in AUTO mode.  It is rate-limited internally so it
+    // does nothing when the interval (kDewUpdateIntervalMs) has not elapsed.
+    updateDewControl();
 
     bOn = m_bCircuitState[nIndex];
     return SB_OK;
@@ -759,67 +836,6 @@ int X2Svbony241Pro::readFrame(int nExpectedBytes, uint8_t* pBufOut)
 // before draining.  SerXInterface does not expose ioctl, so we rely on the
 // USB-CDC chip's built-in auto-reset behavior, which is present on standard
 // ESP32 DevKit hardware.
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// resetEsp32ViaDtr
-//
-// The SV241 Pro uses an ESP32 wired to the CH341 USB-UART bridge.
-// The CH341 maps DTR → ESP32 EN (active-low reset).  Asserting DTR pulls EN
-// low (reset); releasing DTR lets EN go high and the ESP32 boots.
-//
-// TSX's SerXInterface::open() may or may not assert DTR depending on the OS
-// and driver.  If a previous session left DTR asserted, the ESP32 stays in
-// reset and never responds.  We therefore toggle DTR explicitly every time we
-// open the port, guaranteeing a clean boot sequence.
-//
-// Implementation: open a second file descriptor to the same device just long
-// enough to manipulate the modem control lines, then close it.  This is safe
-// because the CH341 is a USB-CDC device — multiple opens share the same USB
-// endpoint and the second fd does not steal I/O from SerXInterface.
-//
-// Platform: Linux and macOS only.  On Windows, SerXInterface handles DTR
-// implicitly and the CH341 WinUSB/COM driver behaves differently; we skip the
-// ioctl path there and rely on SerXInterface to reset the device on open.
-// ---------------------------------------------------------------------------
-static void resetEsp32ViaDtr(const char* pszPort, int assertMs, int bootWaitMs)
-{
-#if defined(SB_LINUX_BUILD) || defined(SB_MACOSX_BUILD)
-    int fd = ::open(pszPort, O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (fd < 0)
-        return;  // non-fatal
-
-    int modem = 0;
-    ::ioctl(fd, TIOCMGET, &modem);
-
-    // Assert DTR → ESP32 EN LOW → reset
-    modem |= TIOCM_DTR;
-    ::ioctl(fd, TIOCMSET, &modem);
-
-    // Hold in reset for assertMs milliseconds
-    struct timespec ts;
-    ts.tv_sec  = assertMs / 1000;
-    ts.tv_nsec = (assertMs % 1000) * 1000000L;
-    ::nanosleep(&ts, NULL);
-
-    // Release DTR → ESP32 EN HIGH → boot
-    modem &= ~TIOCM_DTR;
-    ::ioctl(fd, TIOCMSET, &modem);
-
-    ::close(fd);
-
-    // Give the ESP32 time to run through its ROM bootloader before the caller
-    // tries to drain the boot log.  The drain adds its own kBootDrainInitSleepMs;
-    // this sleep is intentionally short so the total delay stays reasonable.
-    ts.tv_sec  = bootWaitMs / 1000;
-    ts.tv_nsec = (bootWaitMs % 1000) * 1000000L;
-    ::nanosleep(&ts, NULL);
-#else
-    (void)pszPort;
-    (void)assertMs;
-    (void)bootWaitMs;
-#endif
-}
-
 int X2Svbony241Pro::drainBootLog()
 {
     // No mutex needed here: drainBootLog() is only ever called from
@@ -1150,41 +1166,55 @@ double X2Svbony241Pro::decodeSensor4(const uint8_t* pData4)
 // ---------------------------------------------------------------------------
 // decodeDS18B20Temp  (cmd 0x04)
 //
-// scaled = raw / 100.0
-// temp   = scaled - 255.5       (firmware-baked offset)
-// Result rounded to 2 decimal places.
+// Last 2 bytes = raw DS18B20 temperature register (signed int16, 0.0625 °C/LSB).
+// Returns a value outside [-60, 130] when the probe is absent/erroring.
 // ---------------------------------------------------------------------------
 double X2Svbony241Pro::decodeDS18B20Temp(const uint8_t* pData4)
 {
-    double scaled = decodeSensor4(pData4);
-    double tempC  = scaled - 255.5;
+    int16_t raw16 = static_cast<int16_t>(
+        (static_cast<uint16_t>(pData4[2]) << 8) | pData4[3]);
+    double tempC = static_cast<double>(raw16) * 0.0625;
     return floor(tempC * 100.0 + 0.5) / 100.0;
 }
 
 // ---------------------------------------------------------------------------
 // decodeSHT40Temp  (cmd 0x05)
 //
-// scaled = raw / 100.0
-// temp   = scaled - 254.0       (firmware-baked offset)
-// Result rounded to 1 decimal place.
+// The ESP32 firmware encodes SHT40 temperature as a 4-byte big-endian uint32
+// using: wire_value = (tempC + 254.0) * 100, i.e. tempC = raw32/100.0 - 254.0.
+// It does NOT send raw SHT40 ADC counts — the SHT40 datasheet formula does
+// not apply here.  Confirmed by live serial capture: raw32=28190 → 27.9°C,
+// consistent with a warm room.
 // ---------------------------------------------------------------------------
 double X2Svbony241Pro::decodeSHT40Temp(const uint8_t* pData4)
 {
-    double scaled = decodeSensor4(pData4);
-    double tempC  = scaled - 254.0;
+    uint32_t raw32 = (static_cast<uint32_t>(pData4[0]) << 24)
+                   | (static_cast<uint32_t>(pData4[1]) << 16)
+                   | (static_cast<uint32_t>(pData4[2]) <<  8)
+                   |  static_cast<uint32_t>(pData4[3]);
+    double tempC = static_cast<double>(raw32) / 100.0 - 254.0;
     return floor(tempC * 10.0 + 0.5) / 10.0;
 }
 
 // ---------------------------------------------------------------------------
 // decodeSHT40Humidity  (cmd 0x06)
 //
-// Same formula as SHT40 temperature decode; units are % RH.
+// The ESP32 firmware encodes SHT40 humidity as a 4-byte big-endian uint32
+// using: wire_value = (rh% + 254.0) * 100, i.e. rh = raw32/100.0 - 254.0.
+// Same encoding as temperature (same firmware formula for both channels).
+// Confirmed by live serial capture: raw32=32552 → 71.5% RH, consistent with
+// a very humid room (user-reported 70%+). Clamped to [0, 100].
 // ---------------------------------------------------------------------------
 double X2Svbony241Pro::decodeSHT40Humidity(const uint8_t* pData4)
 {
-    double scaled    = decodeSensor4(pData4);
-    double humidity  = scaled - 254.0;
-    return floor(humidity * 10.0 + 0.5) / 10.0;
+    uint32_t raw32 = (static_cast<uint32_t>(pData4[0]) << 24)
+                   | (static_cast<uint32_t>(pData4[1]) << 16)
+                   | (static_cast<uint32_t>(pData4[2]) <<  8)
+                   |  static_cast<uint32_t>(pData4[3]);
+    double rh = static_cast<double>(raw32) / 100.0 - 254.0;
+    if (rh < 0.0)   rh = 0.0;
+    if (rh > 100.0) rh = 100.0;
+    return floor(rh * 10.0 + 0.5) / 10.0;
 }
 
 // ===========================================================================
@@ -1397,23 +1427,43 @@ int X2Svbony241Pro::calcAutoDutyPct(int heaterIdx) const
 // Never returns a fatal error to the caller — sensor failures are handled
 // internally via the per-heater fallback configuration.
 // ---------------------------------------------------------------------------
-int X2Svbony241Pro::updateDewControl()
+int X2Svbony241Pro::updateDewControl(bool bForce)
 {
     if (!m_bLinked)
         return ERR_COMMNOLINK;
 
-    // Rate-limit: skip if updated recently.
+    // Skip sensor reads during post-reset sensor warmup period.
+    // The ESP32 returns sentinel values for ~15s after a hardware reset.
+    if (m_nResetTimeTick > 0 && m_pTickCount)
+    {
+        int msSinceReset = m_pTickCount->elapsed() - m_nResetTimeTick;
+        if (msSinceReset < kSensorWarmupMs)
+        {
+            logDebug(kDebugCommands,
+                     "X2Svbony241Pro: sensor warmup in progress (%d ms / %d ms)",
+                     msSinceReset, kSensorWarmupMs);
+            return SB_OK;  // don't stamp m_nLastDewUpdateTick; allow retry on next poll
+        }
+    }
+
+    // Rate-limit: skip if updated recently — unless bForce is set.
+    // bForce is used by the dialog timer (5 s) to bypass the slower background
+    // rate (30 s) without resetting m_nLastDewUpdateTick, so both clocks coexist.
     // elapsed() returns int (ms since TSX started).  Use int throughout to
     // avoid signed/unsigned comparison pitfalls and to match the interface type.
     int now = m_pTickCount ? m_pTickCount->elapsed() : 0;
-    if (m_nLastDewUpdateTick != 0 &&
+    if (!bForce &&
+        m_nLastDewUpdateTick != 0 &&
         (now - m_nLastDewUpdateTick) < kDewUpdateIntervalMs)
         return SB_OK;
 
-    // --- Read sensors ---
-    // Stamp the update time AFTER a successful read, not before, so that a
-    // serial timeout (up to 600 ms per command) does not suppress the retry
-    // for the full 30-second interval.
+    // --- Read all sensors ---
+    // SHT40 (ambient temp + humidity) drives the auto-dew algorithm.
+    // INA219 (voltage + current) and DS18B20 (lens temp) are read here too
+    // so the UI always has fresh data regardless of dew heater mode.
+    // Stamp the rate-limit timestamp only on success so transient failures
+    // cause a retry on the next poll rather than waiting the full interval.
+
     double tempC    = 0.0;
     double humidity = 0.0;
     int nErrT = cmdReadSHT40Temp(tempC);
@@ -1422,25 +1472,57 @@ int X2Svbony241Pro::updateDewControl()
     if (nErrT == SB_OK && nErrH == SB_OK &&
         humidity >= 0.0 && humidity <= 100.0)
     {
-        m_dAmbientTempC         = tempC;
-        m_dAmbientHumidityPct   = humidity;
-        m_dDewPointC            = calcDewPoint(tempC, humidity);
-        m_bSensorValid          = true;
-        // Only update the rate-limit timestamp on a successful read so that
-        // transient failures cause a retry on the next poll rather than waiting
-        // the full interval.
-        m_nLastDewUpdateTick    = now;
+        // Reject sentinel values that indicate firmware hasn't initialized sensors yet.
+        // Sentinel: raw==25600 → decoded as exactly 2.0°C / 2.0% RH.
+        if (tempC < 3.0 && humidity < 3.0)
+        {
+            m_bSensorValid = false;
+            logDebug(kDebugErrors, "X2Svbony241Pro: SHT40 sentinel values — skipping (warmup?)");
+            return SB_OK;   // don't stamp timestamp; allow retry on next poll
+        }
+
+        m_dAmbientTempC       = tempC;
+        m_dAmbientHumidityPct = humidity;
+        m_dDewPointC          = calcDewPoint(tempC, humidity);
+        m_bSensorValid        = true;
+        m_nLastDewUpdateTick  = now;
 
         logDebug(kDebugCommands,
-                 "X2Svbony241Pro: dew update — ambient %.1f C  RH %.0f%%  dewpoint %.1f C",
+                 "X2Svbony241Pro: sensor update — ambient %.1f C  RH %.0f%%  dewpoint %.1f C",
                  m_dAmbientTempC, m_dAmbientHumidityPct, m_dDewPointC);
     }
     else
     {
         m_bSensorValid = false;
         logDebug(kDebugErrors,
-                 "X2Svbony241Pro: dew update — SHT40 read failed (errT=%d errH=%d), applying fallback",
+                 "X2Svbony241Pro: SHT40 read failed (errT=%d errH=%d)",
                  nErrT, nErrH);
+    }
+
+    // DS18B20 lens temperature — non-fatal; probe may not be installed.
+    // Valid range: -55°C to +125°C per DS18B20 spec.
+    {
+        double lensT = 0.0;
+        if (cmdReadDS18B20Temp(lensT) == SB_OK &&
+            lensT >= -55.0 && lensT <= 125.0)
+        {
+            m_dLensTempC    = lensT;
+            m_bLensTempValid = true;
+        }
+        else
+        {
+            m_bLensTempValid = false;
+        }
+    }
+
+    // INA219 — non-fatal if unavailable; update cache on success.
+    {
+        double v = 0.0, a = 0.0;
+        if (cmdReadVoltage(v) == SB_OK && v > 1.0)  m_dVoltageV = v;
+        if (cmdReadCurrent(a) == SB_OK)              m_dCurrentA = a;
+        logDebug(kDebugCommands,
+                 "X2Svbony241Pro: INA219 — %.2f V  %.3f A",
+                 m_dVoltageV, m_dCurrentA);
     }
 
     // --- Apply auto PWM to each heater that is on and in auto mode ---
@@ -1531,6 +1613,11 @@ void X2Svbony241Pro::saveDewConfig()
         snprintf(szKey, sizeof(szKey), "DewFallback%d_%d",       i, m_nInstanceIndex);
         m_pIniUtil->writeInt(kIniSection, szKey, static_cast<int>(m_eDewFallback[i]));
     }
+
+    // Regulated voltage — stored as integer tenths of a volt (e.g. 120 = 12.0 V)
+    snprintf(szKey, sizeof(szKey), "RegulatedVoltageTenths_%d", m_nInstanceIndex);
+    m_pIniUtil->writeInt(kIniSection, szKey,
+                         static_cast<int>(m_dRegulatedVoltageV * 10.0 + 0.5));
 }
 
 // ---------------------------------------------------------------------------
@@ -1574,6 +1661,14 @@ void X2Svbony241Pro::loadDewConfig()
         m_eDewFallback[i] = (nVal == static_cast<int>(DEW_FALLBACK_ON))
                             ? DEW_FALLBACK_ON : DEW_FALLBACK_OFF;
     }
+
+    // Regulated voltage — stored as integer tenths of a volt
+    snprintf(szKey, sizeof(szKey), "RegulatedVoltageTenths_%d", m_nInstanceIndex);
+    nVal = m_pIniUtil->readInt(kIniSection, szKey,
+                               static_cast<int>(kDefaultRegulatedVoltageV * 10.0 + 0.5));
+    if (nVal < 0)   nVal = 0;
+    if (nVal > 153) nVal = 153;
+    m_dRegulatedVoltageV = static_cast<double>(nVal) / 10.0;
 
     logDebug(kDebugCommands,
              "X2Svbony241Pro: dew config loaded — "
@@ -1650,8 +1745,36 @@ int X2Svbony241Pro::execModalSettingsDialog()
         // --- Populate static labels ---
         uiex->setText("label_connStatus",
                        m_bLinked ? "Connected" : "Not connected");
-        uiex->setText("label_sensorStatus",
-                       m_bSensorValid ? "OK" : (m_bLinked ? "Read error" : "—"));
+        // Show warmup progress during post-reset sensor warmup; otherwise the
+        // usual OK / Read error / — status.
+        {
+            char szWarmupBuf[64];
+            const char* szSensorStatus;
+            bool bInWarmup = false;
+            if (m_nResetTimeTick > 0 && m_pTickCount)
+            {
+                int msSinceReset = m_pTickCount->elapsed() - m_nResetTimeTick;
+                if (msSinceReset < kSensorWarmupMs)
+                {
+                    bInWarmup = true;
+                    int secsElapsed  = msSinceReset / 1000;
+                    snprintf(szWarmupBuf, sizeof(szWarmupBuf),
+                             "Warming up… ready in %d s",
+                             (kSensorWarmupMs / 1000) - secsElapsed);
+                    szSensorStatus = szWarmupBuf;
+                    uiex->invokeMethod("progressBar_warmup", "show");
+                    uiex->setPropertyInt("progressBar_warmup", "value", secsElapsed);
+                }
+            }
+            if (!bInWarmup)
+            {
+                szSensorStatus =
+                    m_bSensorValid              ? "OK"         :
+                    (m_nLastDewUpdateTick != 0) ? "Read error" : "—";
+                uiex->invokeMethod("progressBar_warmup", "hide");
+            }
+            uiex->setText("label_sensorStatus", szSensorStatus);
+        }
 
         if (m_bLinked && m_bSensorValid)
         {
@@ -1683,9 +1806,17 @@ int X2Svbony241Pro::execModalSettingsDialog()
             snprintf(szBuf, sizeof(szBuf), "%.3f A", m_dCurrentA);
             uiex->setText("label_current", szBuf);
 
-            // Lens temperature is not cached between sessions; show dash until
-            // the next dew-control poll populates it via the timer refresh.
-            uiex->setText("label_lensTemp", "—");
+            // Lens temperature — from cache; "—" when probe absent
+            if (m_bLensTempValid)
+            {
+                char szLens[32];
+                snprintf(szLens, sizeof(szLens), "%.1f °C", m_dLensTempC);
+                uiex->setText("label_lensTemp", szLens);
+            }
+            else
+            {
+                uiex->setText("label_lensTemp", "—");
+            }
 
             // Port states from cache
             const char* kDCLabels[] = { "label_dc1","label_dc2","label_dc3","label_dc4" };
@@ -1737,6 +1868,9 @@ int X2Svbony241Pro::execModalSettingsDialog()
             }
         }
 
+        // --- Adjustable voltage spinbox ---
+        uiex->setPropertyDouble("doubleSpinBox_regulatedVoltage", "value", m_dRegulatedVoltageV);
+
         nErr = pUI->exec(bPressedOK);
         if (nErr) break;
 
@@ -1766,6 +1900,20 @@ int X2Svbony241Pro::execModalSettingsDialog()
 
                 m_nDewFixedDutyPct[i]   = nDuty;
                 m_nDewAggressiveness[i] = nAgg;
+            }
+
+            // Adjustable voltage output
+            double dVoltage = m_dRegulatedVoltageV;
+            uiex->propertyDouble("doubleSpinBox_regulatedVoltage", "value", dVoltage);
+            if (dVoltage < 0.0)  dVoltage = 0.0;
+            if (dVoltage > 15.3) dVoltage = 15.3;
+            m_dRegulatedVoltageV = dVoltage;
+
+            // If circuit 7 is already ON, push the new voltage to the device immediately
+            if (m_bLinked && m_bCircuitState[7])
+            {
+                uint8_t raw = onValueForCircuit(7);
+                cmdSetPort(kPortIndex[7], raw);
             }
 
             // Debug level
@@ -1816,7 +1964,53 @@ void X2Svbony241Pro::uiEvent(X2GUIExchangeInterface* uiex, const char* pszEvent)
         if (!m_bLinked)
             return;
 
-        uiex->setText("label_sensorStatus", m_bSensorValid ? "OK" : "Read error");
+        // Warmup progress or normal sensor status.
+        // TSX suspends circuitState() polling while this modal dialog is open,
+        // so the 30 s background rate never fires.  We drive a 5 s dialog poll
+        // rate here (bForce=true) so readings stay fresh while the dialog is open.
+        {
+            char szWarmupBuf[64];
+            const char* szSensorStatus;
+            bool bInWarmup = false;
+            if (m_nResetTimeTick > 0 && m_pTickCount)
+            {
+                int msSinceReset = m_pTickCount->elapsed() - m_nResetTimeTick;
+                if (msSinceReset < kSensorWarmupMs)
+                {
+                    bInWarmup = true;
+                    int secsElapsed  = msSinceReset / 1000;
+                    snprintf(szWarmupBuf, sizeof(szWarmupBuf),
+                             "Warming up… ready in %d s",
+                             (kSensorWarmupMs / 1000) - secsElapsed);
+                    szSensorStatus = szWarmupBuf;
+                    uiex->invokeMethod("progressBar_warmup", "show");
+                    uiex->setPropertyInt("progressBar_warmup", "value", secsElapsed);
+                }
+            }
+            if (!bInWarmup)
+            {
+                // Dialog-driven polling at 5 s while this dialog is open.
+                // TSX suspends circuitState() while the modal dialog runs, so
+                // the 30 s background rate never fires; we drive our own clock.
+                // bForce=true bypasses the 30 s rate limit but does NOT reset
+                // m_nLastDewUpdateTick, so the background clock is undisturbed.
+                int nowTick = m_pTickCount ? m_pTickCount->elapsed() : 0;
+                if (m_nLastDialogSensorTick == 0 ||
+                    (nowTick - m_nLastDialogSensorTick) >= kDialogPollIntervalMs)
+                {
+                    m_nLastDialogSensorTick = nowTick;
+                    logDebug(kDebugCommands,
+                             "X2Svbony241Pro: dialog timer poll (5 s)");
+                    updateDewControl(true /*bForce*/);
+                }
+
+                szSensorStatus =
+                    m_bSensorValid              ? "OK"         :
+                    (m_nLastDewUpdateTick != 0) ? "Read error" : "—";
+                uiex->invokeMethod("progressBar_warmup", "hide");
+            }
+            uiex->setText("label_sensorStatus", szSensorStatus);
+        }
 
         // Environmental sensor labels — from cache
         char szBuf[64];
@@ -1844,9 +2038,16 @@ void X2Svbony241Pro::uiEvent(X2GUIExchangeInterface* uiex, const char* pszEvent)
         snprintf(szBuf, sizeof(szBuf), "%.3f A", m_dCurrentA);
         uiex->setText("label_current", szBuf);
 
-        // Lens temp — not cached between sessions; show "—" until next poll
-        // (the execModalSettingsDialog initial read and TSX polling update this)
-        uiex->setText("label_lensTemp", "—");
+        // Lens temp — from cache (updated each poll; "—" when probe absent)
+        if (m_bLensTempValid)
+        {
+            snprintf(szBuf, sizeof(szBuf), "%.1f °C", m_dLensTempC);
+            uiex->setText("label_lensTemp", szBuf);
+        }
+        else
+        {
+            uiex->setText("label_lensTemp", "—");
+        }
 
         // DC port on/off states — from cache
         const char* kDCLabels[] = { "label_dc1","label_dc2","label_dc3","label_dc4" };

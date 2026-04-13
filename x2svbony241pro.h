@@ -258,8 +258,10 @@ private:
     // Read SHT40 sensors, recalculate dew point, and push the resulting PWM
     // value to any heater in DEW_MODE_AUTO that is currently on.
     // Rate-limited to once per kDewUpdateIntervalMs via m_nLastDewUpdateTick.
+    // Pass bForce=true to bypass the rate limit (used by the dialog timer for
+    // the 5 s dialog-open poll rate without disturbing the 30 s background rate).
     // Never throws; sensor failures apply the configured fallback.
-    int             updateDewControl();
+    int             updateDewControl(bool bForce = false);
 
     // Persist dew-heater configuration to the TheSkyX ini store.
     void            saveDewConfig();
@@ -319,8 +321,23 @@ private:
     double          m_dDewPointC;
     bool            m_bSensorValid;          // false after any sensor read failure
 
+    // DS18B20 lens temperature (separate validity flag; probe may be absent)
+    double          m_dLensTempC;
+    bool            m_bLensTempValid;
+
     // TickCountInterface timestamp of last successful auto-dew sensor update.
     // Stored as int to match the return type of TickCountInterface::elapsed().
     // Zero means "never updated" (forces the first call to run immediately).
     int             m_nLastDewUpdateTick;
+
+    // Timestamp of the last sensor read triggered from the settings dialog timer.
+    // Independent of m_nLastDewUpdateTick so the dialog (5 s) and background
+    // (30 s) polling rates can coexist without interfering with each other.
+    int             m_nLastDialogSensorTick;
+
+    // TickCountInterface timestamp of the last hardware reset (DTR pulse).
+    // Non-zero means a reset was performed; updateDewControl() skips sensor
+    // reads until kSensorWarmupMs have elapsed from this point.
+    // Zero means no reset has been performed since construction.
+    int             m_nResetTimeTick;
 };
