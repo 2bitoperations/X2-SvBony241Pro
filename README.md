@@ -113,6 +113,72 @@ After restarting, the **SVBony SV241 Pro** entry will appear in the
 
 ---
 
+## Stable Device Name
+
+### The problem
+
+On Linux, USB-serial adapters are assigned a kernel node such as `/dev/ttyUSB0`
+or `/dev/ttyUSB1` based on the order they enumerate at boot time.  If you have
+more than one USB-serial device (very common in astronomy setups — focuser
+controllers, filter wheels, etc.) the SV241 Pro may appear as a different
+`/dev/ttyUSBx` path every time you reboot or replug.  This breaks TheSkyX's
+saved serial-port setting.
+
+### The solution — install a udev rule
+
+The repository ships with a udev rule file `99-sv241pro.rules` that matches the
+SV241 Pro by its USB vendor/product ID (QinHeng CH340, VID `1a86` / PID `7523`)
+and creates a permanent symlink `/dev/ttyUSBSV241Pro` pointing to whichever
+`/dev/ttyUSBx` the device happens to occupy.
+
+Install the rule with:
+
+```bash
+sudo make udev-install
+```
+
+This copies `99-sv241pro.rules` to `/etc/udev/rules.d/`, reloads the udev rule
+database, and triggers udev so existing devices are re-evaluated.
+
+After installation, **replug the SV241 Pro USB cable**.  The symlink
+`/dev/ttyUSBSV241Pro` will appear immediately and will persist across reboots.
+
+In TheSkyX, open **Telescope > Power Control Box**, select **SVBony SV241 Pro**,
+and set the serial port to:
+
+```
+/dev/ttyUSBSV241Pro
+```
+
+### Multiple CH340/CH341 devices
+
+The QinHeng CH340/CH341 chip is used by many inexpensive USB-serial adapters.
+If you have more than one such device connected simultaneously, the VID+PID
+rule above will match all of them and the symlink will point to whichever one
+udev processes last — which is non-deterministic.
+
+To pin the rule to the SV241 Pro specifically, add a serial-number attribute.
+Find the serial number with:
+
+```bash
+udevadm info -a -n /dev/ttyUSBSV241Pro | grep '{serial}'
+```
+
+Then edit `/etc/udev/rules.d/99-sv241pro.rules` and add the serial attribute:
+
+```
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
+    ATTRS{serial}=="YOUR_SERIAL_HERE", SYMLINK+="ttyUSBSV241Pro"
+```
+
+Note: the cheaper CH340 variant (as opposed to CH341) often has no unique serial
+number programmed at the factory.  In that case you may need to use
+`KERNELS=="N-N.N"` (the USB port path) to distinguish devices by physical port.
+Run `udevadm info -a -n /dev/ttyUSBx` and look for the `KERNELS` line to find
+the stable port path for your hardware.
+
+---
+
 ## Troubleshooting / Log File
 
 The driver writes a persistent plain-text log alongside the in-app

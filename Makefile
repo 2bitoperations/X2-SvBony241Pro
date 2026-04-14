@@ -42,7 +42,7 @@ endif
 SRCS = main.cpp x2svbony241pro.cpp
 OBJS = $(SRCS:.cpp=.o)
 
-.PHONY: all clean validate_ui install
+.PHONY: all clean validate_ui install udev-install
 
 all: validate_ui ${TARGET_LIB}
 
@@ -64,6 +64,14 @@ ${TARGET_LIB}: $(OBJS)
 
 install: ${TARGET_LIB}
 	./install.sh
+
+udev-install:
+	@echo "Installing udev rule for SVBony SV241 Pro..."
+	sudo install -m 644 99-sv241pro.rules /etc/udev/rules.d/99-sv241pro.rules
+	sudo udevadm control --reload-rules && sudo udevadm trigger
+	@echo ""
+	@echo "Rule installed.  Please replug the SV241 Pro USB cable."
+	@echo "The device will then appear as /dev/ttyUSBSV241Pro"
 
 clean:
 	$(RM) libx2svbony241pro.so libx2svbony241pro.dylib libx2svbony241pro.dll $(OBJS)

@@ -3,476 +3,510 @@
  <class>X2PowerControl</class>
  <widget class="QDialog" name="X2PowerControl">
   <property name="geometry">
-   <rect><x>0</x><y>0</y><width>480</width><height>720</height></rect>
+   <rect><x>0</x><y>0</y><width>1493</width><height>883</height></rect>
+  </property>
+  <property name="minimumSize">
+   <size><width>600</width><height>400</height></size>
   </property>
   <property name="windowTitle">
    <string>SVBony SV241 Pro Setup</string>
   </property>
-  <layout class="QVBoxLayout" name="verticalLayout_outer">
+  <layout class="QVBoxLayout" name="layoutOuter">
    <item>
     <widget class="X2Form" name="X2Form">
      <property name="enabled"><bool>true</bool></property>
      <property name="frameShape"><enum>QFrame::StyledPanel</enum></property>
      <property name="frameShadow"><enum>QFrame::Raised</enum></property>
-     <layout class="QVBoxLayout" name="mainLayout">
+     <layout class="QVBoxLayout" name="layoutMain">
 
-      <!-- ── Title ─────────────────────────────────────────── -->
+      <!-- ── Title ──────────────────────────────────────────────── -->
       <item>
-       <widget class="QLabel" name="label_title">
+       <widget class="QLabel" name="lblTitle">
         <property name="text"><string>SVBony SV241 Pro USB Power Hub</string></property>
         <property name="alignment"><set>Qt::AlignCenter</set></property>
        </widget>
       </item>
 
-      <!-- ── Device Status ──────────────────────────────────── -->
+      <!-- ── Two-column body ────────────────────────────────────── -->
       <item>
-       <widget class="QGroupBox" name="groupBox_status">
-        <property name="title"><string>Device Status</string></property>
-        <layout class="QGridLayout" name="statusGrid">
+       <layout class="QHBoxLayout" name="layoutColumns">
+        <property name="spacing"><number>8</number></property>
 
-         <item row="0" column="0">
-          <widget class="QLabel" name="label_connCaption">
-           <property name="text"><string>Connection :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="0" column="1">
-          <widget class="QLabel" name="label_connStatus">
-           <property name="text"><string>—</string></property>
-          </widget>
-         </item>
-
-         <item row="1" column="0">
-          <widget class="QLabel" name="label_sensorCaption">
-           <property name="text"><string>Sensor data :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="1" column="1">
-          <widget class="QLabel" name="label_sensorStatus">
-           <property name="text"><string>—</string></property>
-          </widget>
-         </item>
-
-         <!-- Warmup progress bar — shown only during the 15 s post-reset warmup -->
-         <item row="2" column="0" colspan="2">
-          <widget class="QProgressBar" name="progressBar_warmup">
-           <property name="minimum"><number>0</number></property>
-           <property name="maximum"><number>15</number></property>
-           <property name="value"><number>0</number></property>
-           <property name="format"><string>Sensor warmup: %v s / 15 s</string></property>
-           <property name="visible"><bool>false</bool></property>
-          </widget>
-         </item>
-
-        </layout>
-       </widget>
-      </item>
-
-      <!-- ── Environmental Sensors ─────────────────────────── -->
-      <item>
-       <widget class="QGroupBox" name="groupBox_sensors">
-        <property name="title"><string>Environmental Sensors</string></property>
-        <layout class="QGridLayout" name="sensorGrid">
-
-         <item row="0" column="0">
-          <widget class="QLabel" name="label_ambientTempCaption">
-           <property name="text"><string>Ambient temp :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="0" column="1">
-          <widget class="QLabel" name="label_ambientTemp">
-           <property name="text"><string>—</string></property>
-          </widget>
-         </item>
-
-         <item row="1" column="0">
-          <widget class="QLabel" name="label_humidityCaption">
-           <property name="text"><string>Humidity :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="1" column="1">
-          <widget class="QLabel" name="label_humidity">
-           <property name="text"><string>—</string></property>
-          </widget>
-         </item>
-
-         <item row="2" column="0">
-          <widget class="QLabel" name="label_dewPointCaption">
-           <property name="text"><string>Dew point :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="2" column="1">
-          <widget class="QLabel" name="label_dewPoint">
-           <property name="text"><string>—</string></property>
-          </widget>
-         </item>
-
-         <item row="3" column="0">
-          <widget class="QLabel" name="label_lensTempCaption">
-           <property name="text"><string>Lens temp (DS18B20) :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="3" column="1">
-          <widget class="QLabel" name="label_lensTemp">
-           <property name="text"><string>—</string></property>
-          </widget>
-         </item>
-
-        </layout>
-       </widget>
-      </item>
-
-      <!-- ── Power Monitor ─────────────────────────────────── -->
-      <item>
-       <widget class="QGroupBox" name="groupBox_power">
-        <property name="title"><string>Power Monitor (INA219)</string></property>
-        <layout class="QGridLayout" name="powerGrid">
-
-         <item row="0" column="0">
-          <widget class="QLabel" name="label_voltageCaption">
-           <property name="text"><string>Bus voltage :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="0" column="1">
-          <widget class="QLabel" name="label_voltage">
-           <property name="text"><string>—</string></property>
-          </widget>
-         </item>
-
-         <item row="1" column="0">
-          <widget class="QLabel" name="label_currentCaption">
-           <property name="text"><string>Current :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="1" column="1">
-          <widget class="QLabel" name="label_current">
-           <property name="text"><string>—</string></property>
-          </widget>
-         </item>
-
-        </layout>
-       </widget>
-      </item>
-
-      <!-- ── Output States ─────────────────────────────────── -->
-      <item>
-       <widget class="QGroupBox" name="groupBox_outputs">
-        <property name="title"><string>Output States</string></property>
-        <layout class="QGridLayout" name="outputGrid">
-
-         <item row="0" column="0">
-          <widget class="QLabel" name="label_dc1Caption">
-           <property name="text"><string>DC Port 1 :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="0" column="1">
-          <widget class="QLabel" name="label_dc1"><property name="text"><string>—</string></property></widget>
-         </item>
-         <item row="0" column="2">
-          <widget class="QLabel" name="label_dc2Caption">
-           <property name="text"><string>DC Port 2 :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="0" column="3">
-          <widget class="QLabel" name="label_dc2"><property name="text"><string>—</string></property></widget>
-         </item>
-
-         <item row="1" column="0">
-          <widget class="QLabel" name="label_dc3Caption">
-           <property name="text"><string>DC Port 3 :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="1" column="1">
-          <widget class="QLabel" name="label_dc3"><property name="text"><string>—</string></property></widget>
-         </item>
-         <item row="1" column="2">
-          <widget class="QLabel" name="label_dc4Caption">
-           <property name="text"><string>DC Port 4 :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="1" column="3">
-          <widget class="QLabel" name="label_dc4"><property name="text"><string>—</string></property></widget>
-         </item>
-
-         <item row="2" column="0">
-          <widget class="QLabel" name="label_usbCaption">
-           <property name="text"><string>USB Hub :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="2" column="1">
-          <widget class="QLabel" name="label_usb"><property name="text"><string>—</string></property></widget>
-         </item>
-         <item row="2" column="2">
-          <widget class="QLabel" name="label_regulatedCaption">
-           <property name="text"><string>Adj. Output :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="2" column="3">
-          <widget class="QLabel" name="label_regulated"><property name="text"><string>—</string></property></widget>
-         </item>
-
-         <item row="3" column="0" colspan="2">
-          <widget class="QLabel" name="label_regulatedSetCaption">
-           <property name="text"><string>Set Adj. V :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-           <property name="toolTip"><string>Desired output voltage for the adjustable regulated output (Circuit 7).
-Takes effect when the output is switched on, or immediately if already on.</string></property>
-          </widget>
-         </item>
-         <item row="3" column="2" colspan="2">
-          <widget class="QDoubleSpinBox" name="doubleSpinBox_regulatedVoltage">
-           <property name="toolTip"><string>Set the adjustable regulated output voltage (0.0–15.3 V).</string></property>
-           <property name="suffix"><string> V</string></property>
-           <property name="minimum"><double>0.000000000000000</double></property>
-           <property name="maximum"><double>15.300000000000001</double></property>
-           <property name="singleStep"><double>0.100000000000000</double></property>
-           <property name="decimals"><number>1</number></property>
-           <property name="value"><double>12.000000000000000</double></property>
-          </widget>
-         </item>
-
-        </layout>
-       </widget>
-      </item>
-
-      <!-- ── Dew Heater 1 ──────────────────────────────────── -->
-      <item>
-       <widget class="QGroupBox" name="groupBox_dew1">
-        <property name="title"><string>Dew Heater 1 (Circuit 4)</string></property>
-        <layout class="QGridLayout" name="dew1Grid">
-
-         <item row="0" column="0">
-          <widget class="QLabel" name="label_dew1ModeCaption">
-           <property name="text"><string>Mode :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="0" column="1" colspan="2">
-          <widget class="QComboBox" name="comboBox_dew1Mode">
-           <item><property name="text"><string>Manual (fixed duty cycle)</string></property></item>
-           <item><property name="text"><string>Automatic (dew point tracking)</string></property></item>
-          </widget>
-         </item>
-
-         <item row="1" column="0">
-          <widget class="QLabel" name="label_dew1DutyCaption">
-           <property name="text"><string>Duty / fallback % :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-           <property name="toolTip"><string>In Manual mode: the fixed duty cycle sent to the device.
-In Auto mode: used as the fallback level when sensor reads fail (if fallback = On).</string></property>
-          </widget>
-         </item>
-         <item row="1" column="1">
-          <widget class="QSpinBox" name="spinBox_dew1FixedDuty">
-           <property name="minimum"><number>0</number></property>
-           <property name="maximum"><number>100</number></property>
-           <property name="value"><number>50</number></property>
-          </widget>
-         </item>
-         <item row="1" column="2">
-          <widget class="QLabel" name="label_dew1DutyUnit">
-           <property name="text"><string>%</string></property>
-          </widget>
-         </item>
-
-         <!-- Auto-only rows: shown/hidden based on mode combo -->
-         <item row="2" column="0">
-          <widget class="QLabel" name="label_dew1AggCaption">
-           <property name="text"><string>Aggressiveness :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-           <property name="toolTip"><string>Controls how quickly PWM ramps down as temperature rises above the dew point.
-1 = gentle (20°C window before reaching 0%).
-10 = aggressive (2°C window before reaching 0%).</string></property>
-          </widget>
-         </item>
-         <item row="2" column="1">
-          <widget class="QSpinBox" name="spinBox_dew1Aggressiveness">
-           <property name="minimum"><number>1</number></property>
-           <property name="maximum"><number>10</number></property>
-           <property name="value"><number>5</number></property>
-           <property name="toolTip"><string>1 = gentle, 10 = aggressive</string></property>
-          </widget>
-         </item>
-         <item row="2" column="2">
-          <widget class="QLabel" name="label_dew1AggHint">
-           <property name="text"><string>(1=gentle … 10=aggressive)</string></property>
-          </widget>
-         </item>
-
-         <item row="3" column="0">
-          <widget class="QLabel" name="label_dew1FallbackCaption">
-           <property name="text"><string>Sensor failure :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-           <property name="toolTip"><string>What to do if the SHT40 sensor cannot be read.</string></property>
-          </widget>
-         </item>
-         <item row="3" column="1" colspan="2">
-          <widget class="QComboBox" name="comboBox_dew1Fallback">
-           <item><property name="text"><string>Turn heater off</string></property></item>
-           <item><property name="text"><string>Run at fixed / fallback duty</string></property></item>
-          </widget>
-         </item>
-
-         <item row="4" column="0">
-          <widget class="QLabel" name="label_dew1AutoDutyCaption">
-           <property name="text"><string>Computed duty :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="4" column="1" colspan="2">
-          <widget class="QLabel" name="label_dew1AutoDuty">
-           <property name="text"><string>—</string></property>
-          </widget>
-         </item>
-
-        </layout>
-       </widget>
-      </item>
-
-      <!-- ── Dew Heater 2 ──────────────────────────────────── -->
-      <item>
-       <widget class="QGroupBox" name="groupBox_dew2">
-        <property name="title"><string>Dew Heater 2 (Circuit 5)</string></property>
-        <layout class="QGridLayout" name="dew2Grid">
-
-         <item row="0" column="0">
-          <widget class="QLabel" name="label_dew2ModeCaption">
-           <property name="text"><string>Mode :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="0" column="1" colspan="2">
-          <widget class="QComboBox" name="comboBox_dew2Mode">
-           <item><property name="text"><string>Manual (fixed duty cycle)</string></property></item>
-           <item><property name="text"><string>Automatic (dew point tracking)</string></property></item>
-          </widget>
-         </item>
-
-         <item row="1" column="0">
-          <widget class="QLabel" name="label_dew2DutyCaption">
-           <property name="text"><string>Duty / fallback % :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-           <property name="toolTip"><string>In Manual mode: the fixed duty cycle sent to the device.
-In Auto mode: used as the fallback level when sensor reads fail (if fallback = On).</string></property>
-          </widget>
-         </item>
-         <item row="1" column="1">
-          <widget class="QSpinBox" name="spinBox_dew2FixedDuty">
-           <property name="minimum"><number>0</number></property>
-           <property name="maximum"><number>100</number></property>
-           <property name="value"><number>50</number></property>
-          </widget>
-         </item>
-         <item row="1" column="2">
-          <widget class="QLabel" name="label_dew2DutyUnit">
-           <property name="text"><string>%</string></property>
-          </widget>
-         </item>
-
-         <item row="2" column="0">
-          <widget class="QLabel" name="label_dew2AggCaption">
-           <property name="text"><string>Aggressiveness :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-           <property name="toolTip"><string>Controls how quickly PWM ramps down as temperature rises above the dew point.
-1 = gentle (20°C window before reaching 0%).
-10 = aggressive (2°C window before reaching 0%).</string></property>
-          </widget>
-         </item>
-         <item row="2" column="1">
-          <widget class="QSpinBox" name="spinBox_dew2Aggressiveness">
-           <property name="minimum"><number>1</number></property>
-           <property name="maximum"><number>10</number></property>
-           <property name="value"><number>5</number></property>
-           <property name="toolTip"><string>1 = gentle, 10 = aggressive</string></property>
-          </widget>
-         </item>
-         <item row="2" column="2">
-          <widget class="QLabel" name="label_dew2AggHint">
-           <property name="text"><string>(1=gentle … 10=aggressive)</string></property>
-          </widget>
-         </item>
-
-         <item row="3" column="0">
-          <widget class="QLabel" name="label_dew2FallbackCaption">
-           <property name="text"><string>Sensor failure :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-           <property name="toolTip"><string>What to do if the SHT40 sensor cannot be read.</string></property>
-          </widget>
-         </item>
-         <item row="3" column="1" colspan="2">
-          <widget class="QComboBox" name="comboBox_dew2Fallback">
-           <item><property name="text"><string>Turn heater off</string></property></item>
-           <item><property name="text"><string>Run at fixed / fallback duty</string></property></item>
-          </widget>
-         </item>
-
-         <item row="4" column="0">
-          <widget class="QLabel" name="label_dew2AutoDutyCaption">
-           <property name="text"><string>Computed duty :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-          </widget>
-         </item>
-         <item row="4" column="1" colspan="2">
-          <widget class="QLabel" name="label_dew2AutoDuty">
-           <property name="text"><string>—</string></property>
-          </widget>
-         </item>
-
-        </layout>
-       </widget>
-      </item>
-
-      <!-- ── Debug Logging ──────────────────────────────────── -->
-      <item>
-       <widget class="QGroupBox" name="groupBox_debug">
-        <property name="title"><string>Debug Logging</string></property>
-        <layout class="QHBoxLayout" name="debugLayout">
-         <item>
-          <widget class="QLabel" name="label_debugCaption">
-           <property name="text"><string>Verbosity :</string></property>
-           <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-           <property name="toolTip"><string>0=Off, 1=Errors, 2=Commands, 3=Full I/O.
-Errors always logged to ~/TheSkyX/x2svbony241pro.log</string></property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QComboBox" name="comboBox_debugLevel">
-           <property name="toolTip"><string>0=Off, 1=Errors, 2=Commands, 3=Full I/O.
-Errors always logged to ~/TheSkyX/x2svbony241pro.log</string></property>
-           <item><property name="text"><string>Off</string></property></item>
-           <item><property name="text"><string>Errors only</string></property></item>
-           <item><property name="text"><string>Commands</string></property></item>
-           <item><property name="text"><string>Full I/O</string></property></item>
-          </widget>
-         </item>
-        </layout>
-       </widget>
-      </item>
-
-      <!-- ── Spacer + OK/Cancel ────────────────────────────── -->
-      <item>
-       <spacer name="verticalSpacer">
-        <property name="orientation"><enum>Qt::Vertical</enum></property>
-        <property name="sizeHint" stdset="0"><size><width>20</width><height>8</height></size></property>
-       </spacer>
-      </item>
-      <item>
-       <layout class="QHBoxLayout" name="buttonLayout">
+        <!-- ════ LEFT COLUMN — monitoring (read-only) ════ -->
         <item>
-         <spacer name="horizontalSpacer">
+         <layout class="QVBoxLayout" name="layoutLeftCol">
+
+          <!-- Device Status -->
+          <item>
+           <widget class="QGroupBox" name="grpStatus">
+            <property name="title"><string>Device Status</string></property>
+            <layout class="QGridLayout" name="layoutStatusGrid">
+
+             <item row="0" column="0">
+              <widget class="QLabel" name="lblConnectionCaption">
+               <property name="text"><string>Connection :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="0" column="1">
+              <widget class="QLabel" name="lblConnectionStatus">
+               <property name="text"><string>—</string></property>
+              </widget>
+             </item>
+
+             <item row="1" column="0">
+              <widget class="QLabel" name="lblSensorCaption">
+               <property name="text"><string>Sensor data :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="1" column="1">
+              <widget class="QLabel" name="lblSensorStatus">
+               <property name="text"><string>—</string></property>
+              </widget>
+             </item>
+
+             <!-- Warmup progress bar — shown only during 15 s post-reset warmup -->
+             <item row="2" column="0" colspan="2">
+              <widget class="QProgressBar" name="progressWarmup">
+               <property name="minimum"><number>0</number></property>
+               <property name="maximum"><number>15</number></property>
+               <property name="value"><number>0</number></property>
+               <property name="format"><string>Sensor warmup: %v s / 15 s</string></property>
+               <property name="visible"><bool>false</bool></property>
+              </widget>
+             </item>
+
+            </layout>
+           </widget>
+          </item>
+
+          <!-- Environmental Sensors -->
+          <item>
+           <widget class="QGroupBox" name="grpSensors">
+            <property name="title"><string>Environmental Sensors</string></property>
+            <layout class="QGridLayout" name="layoutSensorGrid">
+
+             <item row="0" column="0">
+              <widget class="QLabel" name="lblAmbientTempCaption">
+               <property name="text"><string>Ambient temp :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="0" column="1">
+              <widget class="QLabel" name="lblAmbientTemp">
+               <property name="text"><string>—</string></property>
+              </widget>
+             </item>
+
+             <item row="1" column="0">
+              <widget class="QLabel" name="lblHumidityCaption">
+               <property name="text"><string>Humidity :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="1" column="1">
+              <widget class="QLabel" name="lblHumidity">
+               <property name="text"><string>—</string></property>
+              </widget>
+             </item>
+
+             <item row="2" column="0">
+              <widget class="QLabel" name="lblDewPointCaption">
+               <property name="text"><string>Dew point :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="2" column="1">
+              <widget class="QLabel" name="lblDewPoint">
+               <property name="text"><string>—</string></property>
+              </widget>
+             </item>
+
+             <item row="3" column="0">
+              <widget class="QLabel" name="lblLensTempCaption">
+               <property name="text"><string>Hub temp (SHT40) :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="3" column="1">
+              <widget class="QLabel" name="lblLensTemp">
+               <property name="text"><string>—</string></property>
+              </widget>
+             </item>
+
+            </layout>
+           </widget>
+          </item>
+
+          <!-- Power Monitor -->
+          <item>
+           <widget class="QGroupBox" name="grpPower">
+            <property name="title"><string>Power Monitor (INA219)</string></property>
+            <layout class="QGridLayout" name="layoutPowerGrid">
+
+             <item row="0" column="0">
+              <widget class="QLabel" name="lblVoltageCaption">
+               <property name="text"><string>Bus voltage :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="0" column="1">
+              <widget class="QLabel" name="lblVoltage">
+               <property name="text"><string>—</string></property>
+              </widget>
+             </item>
+
+             <item row="1" column="0">
+              <widget class="QLabel" name="lblCurrentCaption">
+               <property name="text"><string>Current :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="1" column="1">
+              <widget class="QLabel" name="lblCurrent">
+               <property name="text"><string>—</string></property>
+              </widget>
+             </item>
+
+            </layout>
+           </widget>
+          </item>
+
+          <!-- Output States -->
+          <item>
+           <widget class="QGroupBox" name="grpOutputs">
+            <property name="title"><string>Output States</string></property>
+            <layout class="QGridLayout" name="layoutOutputGrid">
+
+             <item row="0" column="0">
+              <widget class="QLabel" name="lblDC1Caption">
+               <property name="text"><string>DC Port 1 :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="0" column="1">
+              <widget class="QLabel" name="lblDC1State"><property name="text"><string>—</string></property></widget>
+             </item>
+             <item row="0" column="2">
+              <widget class="QLabel" name="lblDC2Caption">
+               <property name="text"><string>DC Port 2 :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="0" column="3">
+              <widget class="QLabel" name="lblDC2State"><property name="text"><string>—</string></property></widget>
+             </item>
+
+             <item row="1" column="0">
+              <widget class="QLabel" name="lblDC3Caption">
+               <property name="text"><string>DC Port 3 :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="1" column="1">
+              <widget class="QLabel" name="lblDC3State"><property name="text"><string>—</string></property></widget>
+             </item>
+             <item row="1" column="2">
+              <widget class="QLabel" name="lblDC4Caption">
+               <property name="text"><string>DC Port 4 :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="1" column="3">
+              <widget class="QLabel" name="lblDC4State"><property name="text"><string>—</string></property></widget>
+             </item>
+
+             <item row="2" column="0">
+              <widget class="QLabel" name="lblUSBCaption">
+               <property name="text"><string>USB Hub :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="2" column="1">
+              <widget class="QLabel" name="lblUSBState"><property name="text"><string>—</string></property></widget>
+             </item>
+             <item row="2" column="2">
+              <widget class="QLabel" name="lblRegulatedCaption">
+               <property name="text"><string>Adj. Output :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="2" column="3">
+              <widget class="QLabel" name="lblRegulatedState"><property name="text"><string>—</string></property></widget>
+             </item>
+
+             <item row="3" column="0" colspan="2">
+              <widget class="QLabel" name="lblRegulatedSetCaption">
+               <property name="text"><string>Set Adj. V :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+               <property name="toolTip"><string>Desired output voltage for the adjustable regulated output (Circuit 7).
+Takes effect when the output is switched on, or immediately if already on.</string></property>
+              </widget>
+             </item>
+             <item row="3" column="2" colspan="2">
+              <widget class="QDoubleSpinBox" name="dblSpinRegulatedVoltage">
+               <property name="toolTip"><string>Set the adjustable regulated output voltage (0.0–15.3 V).</string></property>
+               <property name="suffix"><string> V</string></property>
+               <property name="minimum"><double>0.000000000000000</double></property>
+               <property name="maximum"><double>15.300000000000001</double></property>
+               <property name="singleStep"><double>0.100000000000000</double></property>
+               <property name="decimals"><number>1</number></property>
+               <property name="value"><double>12.000000000000000</double></property>
+              </widget>
+             </item>
+
+            </layout>
+           </widget>
+          </item>
+
+          <!-- left column bottom spacer -->
+          <item>
+           <spacer name="spacerLeftCol">
+            <property name="orientation"><enum>Qt::Vertical</enum></property>
+            <property name="sizeHint" stdset="0"><size><width>20</width><height>8</height></size></property>
+           </spacer>
+          </item>
+
+         </layout>
+        </item>
+
+        <!-- ════ RIGHT COLUMN — dew heater controls ════ -->
+        <item>
+         <layout class="QVBoxLayout" name="layoutRightCol">
+
+          <!-- Dew Heater 1 -->
+          <item>
+           <widget class="QGroupBox" name="grpDew1">
+            <property name="title"><string>Dew Heater 1 (Circuit 4)</string></property>
+            <layout class="QGridLayout" name="layoutDew1Grid">
+
+             <item row="0" column="0">
+              <widget class="QLabel" name="lblDew1ModeCaption">
+               <property name="text"><string>Mode :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="0" column="1" colspan="2">
+              <widget class="QComboBox" name="comboDew1Mode">
+               <item><property name="text"><string>Manual (fixed duty cycle)</string></property></item>
+               <item><property name="text"><string>Automatic (dew point tracking)</string></property></item>
+              </widget>
+             </item>
+
+             <item row="1" column="0">
+              <widget class="QLabel" name="lblDew1DutyCaption">
+               <property name="text"><string>Duty / fallback % :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+               <property name="toolTip"><string>In Manual mode: the fixed duty cycle sent to the device.
+In Auto mode: used as the fallback level when sensor reads fail (if fallback = On).</string></property>
+              </widget>
+             </item>
+             <item row="1" column="1">
+              <widget class="QSpinBox" name="spinDew1FixedDuty">
+               <property name="minimum"><number>0</number></property>
+               <property name="maximum"><number>100</number></property>
+               <property name="value"><number>50</number></property>
+              </widget>
+             </item>
+             <item row="1" column="2">
+              <widget class="QLabel" name="lblDew1DutyUnit">
+               <property name="text"><string>%</string></property>
+              </widget>
+             </item>
+
+             <item row="2" column="0">
+              <widget class="QLabel" name="lblDew1AggressivenessCaption">
+               <property name="text"><string>Aggressiveness :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+               <property name="toolTip"><string>Controls how quickly PWM ramps down as temperature rises above the dew point.
+1 = gentle (20°C window before reaching 0%).
+10 = aggressive (2°C window before reaching 0%).</string></property>
+              </widget>
+             </item>
+             <item row="2" column="1">
+              <widget class="QSpinBox" name="spinDew1Aggressiveness">
+               <property name="minimum"><number>1</number></property>
+               <property name="maximum"><number>10</number></property>
+               <property name="value"><number>5</number></property>
+               <property name="toolTip"><string>1 = gentle, 10 = aggressive</string></property>
+              </widget>
+             </item>
+             <item row="2" column="2">
+              <widget class="QLabel" name="lblDew1AggressivenessHint">
+               <property name="text"><string>(1=gentle … 10=aggressive)</string></property>
+              </widget>
+             </item>
+
+             <item row="3" column="0">
+              <widget class="QLabel" name="lblDew1FallbackCaption">
+               <property name="text"><string>Sensor failure :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+               <property name="toolTip"><string>What to do if the SHT40 sensor cannot be read.</string></property>
+              </widget>
+             </item>
+             <item row="3" column="1" colspan="2">
+              <widget class="QComboBox" name="comboDew1Fallback">
+               <item><property name="text"><string>Turn heater off</string></property></item>
+               <item><property name="text"><string>Run at fixed / fallback duty</string></property></item>
+              </widget>
+             </item>
+
+             <item row="4" column="0">
+              <widget class="QLabel" name="lblDew1AutoDutyCaption">
+               <property name="text"><string>Computed duty :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="4" column="1" colspan="2">
+              <widget class="QLabel" name="lblDew1AutoDuty">
+               <property name="text"><string>—</string></property>
+              </widget>
+             </item>
+
+            </layout>
+           </widget>
+          </item>
+
+          <!-- Dew Heater 2 -->
+          <item>
+           <widget class="QGroupBox" name="grpDew2">
+            <property name="title"><string>Dew Heater 2 (Circuit 5)</string></property>
+            <layout class="QGridLayout" name="layoutDew2Grid">
+
+             <item row="0" column="0">
+              <widget class="QLabel" name="lblDew2ModeCaption">
+               <property name="text"><string>Mode :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="0" column="1" colspan="2">
+              <widget class="QComboBox" name="comboDew2Mode">
+               <item><property name="text"><string>Manual (fixed duty cycle)</string></property></item>
+               <item><property name="text"><string>Automatic (dew point tracking)</string></property></item>
+              </widget>
+             </item>
+
+             <item row="1" column="0">
+              <widget class="QLabel" name="lblDew2DutyCaption">
+               <property name="text"><string>Duty / fallback % :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+               <property name="toolTip"><string>In Manual mode: the fixed duty cycle sent to the device.
+In Auto mode: used as the fallback level when sensor reads fail (if fallback = On).</string></property>
+              </widget>
+             </item>
+             <item row="1" column="1">
+              <widget class="QSpinBox" name="spinDew2FixedDuty">
+               <property name="minimum"><number>0</number></property>
+               <property name="maximum"><number>100</number></property>
+               <property name="value"><number>50</number></property>
+              </widget>
+             </item>
+             <item row="1" column="2">
+              <widget class="QLabel" name="lblDew2DutyUnit">
+               <property name="text"><string>%</string></property>
+              </widget>
+             </item>
+
+             <item row="2" column="0">
+              <widget class="QLabel" name="lblDew2AggressivenessCaption">
+               <property name="text"><string>Aggressiveness :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+               <property name="toolTip"><string>Controls how quickly PWM ramps down as temperature rises above the dew point.
+1 = gentle (20°C window before reaching 0%).
+10 = aggressive (2°C window before reaching 0%).</string></property>
+              </widget>
+             </item>
+             <item row="2" column="1">
+              <widget class="QSpinBox" name="spinDew2Aggressiveness">
+               <property name="minimum"><number>1</number></property>
+               <property name="maximum"><number>10</number></property>
+               <property name="value"><number>5</number></property>
+               <property name="toolTip"><string>1 = gentle, 10 = aggressive</string></property>
+              </widget>
+             </item>
+             <item row="2" column="2">
+              <widget class="QLabel" name="lblDew2AggressivenessHint">
+               <property name="text"><string>(1=gentle … 10=aggressive)</string></property>
+              </widget>
+             </item>
+
+             <item row="3" column="0">
+              <widget class="QLabel" name="lblDew2FallbackCaption">
+               <property name="text"><string>Sensor failure :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+               <property name="toolTip"><string>What to do if the SHT40 sensor cannot be read.</string></property>
+              </widget>
+             </item>
+             <item row="3" column="1" colspan="2">
+              <widget class="QComboBox" name="comboDew2Fallback">
+               <item><property name="text"><string>Turn heater off</string></property></item>
+               <item><property name="text"><string>Run at fixed / fallback duty</string></property></item>
+              </widget>
+             </item>
+
+             <item row="4" column="0">
+              <widget class="QLabel" name="lblDew2AutoDutyCaption">
+               <property name="text"><string>Computed duty :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="4" column="1" colspan="2">
+              <widget class="QLabel" name="lblDew2AutoDuty">
+               <property name="text"><string>—</string></property>
+              </widget>
+             </item>
+
+            </layout>
+           </widget>
+          </item>
+
+          <!-- Debug Logging -->
+          <item>
+           <widget class="QGroupBox" name="grpDebug">
+            <property name="title"><string>Debug Logging</string></property>
+            <layout class="QHBoxLayout" name="layoutDebug">
+             <item>
+              <widget class="QLabel" name="lblDebugCaption">
+               <property name="text"><string>Verbosity :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+               <property name="toolTip"><string>0=Off, 1=Errors, 2=Commands, 3=Full I/O.
+Errors always logged to ~/TheSkyX/x2svbony241pro.log</string></property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QComboBox" name="comboDebugLevel">
+               <property name="toolTip"><string>0=Off, 1=Errors, 2=Commands, 3=Full I/O.
+Errors always logged to ~/TheSkyX/x2svbony241pro.log</string></property>
+               <item><property name="text"><string>Off</string></property></item>
+               <item><property name="text"><string>Errors only</string></property></item>
+               <item><property name="text"><string>Commands</string></property></item>
+               <item><property name="text"><string>Full I/O</string></property></item>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+          </item>
+
+          <!-- right column bottom spacer -->
+          <item>
+           <spacer name="spacerRightCol">
+            <property name="orientation"><enum>Qt::Vertical</enum></property>
+            <property name="sizeHint" stdset="0"><size><width>20</width><height>8</height></size></property>
+           </spacer>
+          </item>
+
+         </layout>
+        </item>
+
+       </layout>
+      </item>
+
+      <!-- ── OK/Cancel (full width, inside X2Form) ──────────────── -->
+      <item>
+       <layout class="QHBoxLayout" name="layoutButtons">
+        <item>
+         <spacer name="spacerButtons">
           <property name="orientation"><enum>Qt::Horizontal</enum></property>
           <property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property>
          </spacer>

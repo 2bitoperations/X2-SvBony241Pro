@@ -316,14 +316,18 @@ private:
     DewFallback     m_eDewFallback[2];       // what to do when sensor fails
 
     // Environmental readings refreshed by updateDewControl()
-    double          m_dAmbientTempC;
-    double          m_dAmbientHumidityPct;
+    double          m_dAmbientTempC;       // DS18B20 when valid, else SHT40 (used by algorithm + display)
+    double          m_dAmbientHumidityPct; // SHT40 RH
     double          m_dDewPointC;
-    bool            m_bSensorValid;          // false after any sensor read failure
+    double          m_dHubTempC;           // SHT40 raw temperature (device-internal, self-heated)
+    bool            m_bSensorValid;        // false after any SHT40 read failure
 
-    // DS18B20 lens temperature (separate validity flag; probe may be absent)
+    // DS18B20 lens/ambient temperature (separate validity flag; probe may be absent)
     double          m_dLensTempC;
     bool            m_bLensTempValid;
+
+    // Actual duty % last successfully written to each dew heater; -1 = never sent
+    int             m_nLastSentDutyPct[2];
 
     // TickCountInterface timestamp of last successful auto-dew sensor update.
     // Stored as int to match the return type of TickCountInterface::elapsed().

@@ -123,6 +123,7 @@ X2Svbony241Pro::X2Svbony241Pro(
     , m_dAmbientTempC       (0.0)
     , m_dAmbientHumidityPct (0.0)
     , m_dDewPointC          (0.0)
+    , m_dHubTempC           (0.0)
     , m_bSensorValid        (false)
     , m_dLensTempC          (0.0)
     , m_bLensTempValid      (false)
@@ -141,6 +142,7 @@ X2Svbony241Pro::X2Svbony241Pro(
         m_eDewMode[i]           = kDefaultDewMode;
         m_nDewAggressiveness[i] = kDefaultDewAggressiveness;
         m_eDewFallback[i]       = kDefaultDewFallback;
+        m_nLastSentDutyPct[i]   = -1;
     }
 }
 
@@ -1166,14 +1168,19 @@ double X2Svbony241Pro::decodeSensor4(const uint8_t* pData4)
 // ---------------------------------------------------------------------------
 // decodeDS18B20Temp  (cmd 0x04)
 //
-// Last 2 bytes = raw DS18B20 temperature register (signed int16, 0.0625 °C/LSB).
-// Returns a value outside [-60, 130] when the probe is absent/erroring.
+// The ESP32 firmware encodes DS18B20 temperature as a 4-byte big-endian uint32
+// using: wire_value = (tempC + 255.5) * 100, i.e. tempC = raw32/100.0 - 255.5.
+// Same firmware encoding pattern as SHT40 (offset 254.0) and INA219.
+// Confirmed by live serial capture: raw32=27644 (0x00006BFC) -> 20.94 deg C.
+// Returns a value outside [-55, 125] when the probe is absent/erroring.
 // ---------------------------------------------------------------------------
 double X2Svbony241Pro::decodeDS18B20Temp(const uint8_t* pData4)
 {
-    int16_t raw16 = static_cast<int16_t>(
-        (static_cast<uint16_t>(pData4[2]) << 8) | pData4[3]);
-    double tempC = static_cast<double>(raw16) * 0.0625;
+    uint32_t raw32 = (static_cast<uint32_t>(pData4[0]) << 24)
+                   | (static_cast<uint32_t>(pData4[1]) << 16)
+                   | (static_cast<uint32_t>(pData4[2]) <<  8)
+                   |  static_cast<uint32_t>(pData4[3]);
+    double tempC = static_cast<double>(raw32) / 100.0 - 255.5;
     return floor(tempC * 100.0 + 0.5) / 100.0;
 }
 
@@ -1386,9 +1393,22 @@ int X2Svbony241Pro::calcAutoDutyPct(int heaterIdx) const
 {
     if (!m_bSensorValid)
     {
+        int fallbackDuty;
+        const char* fallbackStr;
         if (m_eDewFallback[heaterIdx] == DEW_FALLBACK_ON)
-            return m_nDewFixedDutyPct[heaterIdx];
-        return 0;
+        {
+            fallbackDuty = m_nDewFixedDutyPct[heaterIdx];
+            fallbackStr  = "FALLBACK_ON";
+        }
+        else
+        {
+            fallbackDuty = 0;
+            fallbackStr  = "FALLBACK_OFF";
+        }
+        logDebug(kDebugErrors,
+                 "X2Svbony241Pro: auto duty heater %d: sensor invalid → fallback %s duty=%d%%",
+                 heaterIdx + 1, fallbackStr, fallbackDuty);
+        return fallbackDuty;
     }
 
     double dpd    = m_dAmbientTempC - m_dDewPointC;
@@ -1407,6 +1427,12 @@ int X2Svbony241Pro::calcAutoDutyPct(int heaterIdx) const
         duty = 0;
     else
         duty = static_cast<int>(floor(100.0 * (1.0 - dpd / window) + 0.5));
+
+    logDebug(kDebugCommands,
+             "X2Svbony241Pro: auto duty heater %d: ambient=%.1f°C (%s) dew=%.1f°C dpd=%.1f°C agg=%d window=%.1f°C → duty=%d%%",
+             heaterIdx + 1, m_dAmbientTempC,
+             m_bLensTempValid ? "DS18B20" : "SHT40 fallback",
+             m_dDewPointC, dpd, agg, window, duty);
 
     return duty;
 }
@@ -1458,9 +1484,35 @@ int X2Svbony241Pro::updateDewControl(bool bForce)
         return SB_OK;
 
     // --- Read all sensors ---
-    // SHT40 (ambient temp + humidity) drives the auto-dew algorithm.
-    // INA219 (voltage + current) and DS18B20 (lens temp) are read here too
-    // so the UI always has fresh data regardless of dew heater mode.
+    // Read order: DS18B20 first so its value is available when we compute the
+    // corrected ambient temperature and RH from the SHT40 readings.
+    //
+    // SHT40 is mounted inside the device and runs ~5-6°C warmer than true
+    // ambient due to self-heating.  DS18B20 is the external probe and gives
+    // the accurate ambient temperature.  We therefore:
+    //   • Use DS18B20 as m_dAmbientTempC (fallback: SHT40 when probe absent).
+    //   • Dew point is calculated from ambient T + SHT40 RH.
+    //   • SHT40 RH is used directly — empirically it reads approximately
+    //     correct ambient RH despite the sensor being warmer than ambient.
+
+    // DS18B20 lens temperature — non-fatal; probe may not be installed.
+    // Valid range: -55°C to +125°C per DS18B20 spec.
+    {
+        double lensT = 0.0;
+        if (cmdReadDS18B20Temp(lensT) == SB_OK &&
+            lensT >= -55.0 && lensT <= 125.0)
+        {
+            m_dLensTempC    = lensT;
+            m_bLensTempValid = true;
+        }
+        else
+        {
+            m_bLensTempValid = false;
+        }
+    }
+
+    // SHT40 (internal sensor — provides T+RH for dew point and ambient humidity).
+    // INA219 (voltage + current) is read further below.
     // Stamp the rate-limit timestamp only on success so transient failures
     // cause a retry on the next poll rather than waiting the full interval.
 
@@ -1481,15 +1533,29 @@ int X2Svbony241Pro::updateDewControl(bool bForce)
             return SB_OK;   // don't stamp timestamp; allow retry on next poll
         }
 
-        m_dAmbientTempC       = tempC;
+        // Store SHT40 raw temperature for display ("Hub temp") — self-heated,
+        // not used by the dew algorithm, but useful diagnostics for the user.
+        m_dHubTempC = tempC;
+
+        // Ambient temperature: prefer DS18B20 (external, accurate); fall back to
+        // SHT40 when the probe is absent or out of range.
+        m_dAmbientTempC = m_bLensTempValid ? m_dLensTempC : tempC;
+
+        // SHT40 RH is used as-is — empirically it reads ambient RH correctly.
         m_dAmbientHumidityPct = humidity;
-        m_dDewPointC          = calcDewPoint(tempC, humidity);
-        m_bSensorValid        = true;
-        m_nLastDewUpdateTick  = now;
+
+        // Dew point from ambient temperature + SHT40 RH.
+        m_dDewPointC = calcDewPoint(m_dAmbientTempC, humidity);
+
+        m_bSensorValid       = true;
+        m_nLastDewUpdateTick = now;
 
         logDebug(kDebugCommands,
-                 "X2Svbony241Pro: sensor update — ambient %.1f C  RH %.0f%%  dewpoint %.1f C",
-                 m_dAmbientTempC, m_dAmbientHumidityPct, m_dDewPointC);
+                 "X2Svbony241Pro: sensor update — "
+                 "SHT40 hub %.1f C / %.0f%% RH  |  "
+                 "DS18B20 ambient=%.1f C  |  dewpoint=%.1f C",
+                 m_dHubTempC, humidity,
+                 m_dAmbientTempC, m_dDewPointC);
     }
     else
     {
@@ -1497,22 +1563,6 @@ int X2Svbony241Pro::updateDewControl(bool bForce)
         logDebug(kDebugErrors,
                  "X2Svbony241Pro: SHT40 read failed (errT=%d errH=%d)",
                  nErrT, nErrH);
-    }
-
-    // DS18B20 lens temperature — non-fatal; probe may not be installed.
-    // Valid range: -55°C to +125°C per DS18B20 spec.
-    {
-        double lensT = 0.0;
-        if (cmdReadDS18B20Temp(lensT) == SB_OK &&
-            lensT >= -55.0 && lensT <= 125.0)
-        {
-            m_dLensTempC    = lensT;
-            m_bLensTempValid = true;
-        }
-        else
-        {
-            m_bLensTempValid = false;
-        }
     }
 
     // INA219 — non-fatal if unavailable; update cache on success.
@@ -1535,11 +1585,12 @@ int X2Svbony241Pro::updateDewControl(bool bForce)
 
         int duty = calcAutoDutyPct(i);
 
-        logDebug(kDebugCommands,
-                 "X2Svbony241Pro: dew heater %d auto duty → %d%%", i + 1, duty);
-
         uint8_t raw = static_cast<uint8_t>(
             floor(255.0 * static_cast<double>(duty) / 100.0 + 0.5));
+
+        logDebug(kDebugCommands,
+                 "X2Svbony241Pro: dew%d PWM send: duty=%d%% raw=0x%02X V=%.2fV I=%.3fA",
+                 i + 1, duty, raw, m_dVoltageV, m_dCurrentA);
 
         // Send the new PWM value to the device.
         // Non-fatal: if the command fails we keep the cached state unchanged
@@ -1550,11 +1601,15 @@ int X2Svbony241Pro::updateDewControl(bool bForce)
             logDebug(kDebugErrors,
                      "X2Svbony241Pro: dew heater %d auto PWM command failed (err %d)", i + 1, nErr);
         }
-        else if (duty == 0)
+        else
         {
-            // Algorithm says fully off — reflect that in the circuit cache so
-            // TheSkyX sees the heater as off.
-            m_bCircuitState[4 + i] = false;
+            m_nLastSentDutyPct[i] = duty;
+            if (duty == 0)
+            {
+                // Algorithm says fully off — reflect that in the circuit cache so
+                // TheSkyX sees the heater as off.
+                m_bCircuitState[4 + i] = false;
+            }
         }
     }
 
@@ -1689,32 +1744,30 @@ void X2Svbony241Pro::loadDewConfig()
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// Helper: show or hide all auto-only rows for one heater in the dialog.
+// Helper: enable or disable all auto-only rows for one heater in the dialog.
 // heaterIdx 0 = Dew Heater 1, 1 = Dew Heater 2.
-// bAutoMode true → show the auto-only widgets; false → hide them.
+// bAutoMode true → enable the auto-only widgets; false → disable (grey out).
+// Widgets remain always visible so the user can see what controls exist.
 // ---------------------------------------------------------------------------
-static void setDewAutoRowsVisible(X2GUIExchangeInterface* uiex, int heaterIdx, bool bAutoMode)
+static void setDewAutoRowsEnabled(X2GUIExchangeInterface* uiex, int heaterIdx, bool bAutoMode)
 {
-    // Widget name suffix: "" for heater 0, "2" for heater 1 — matches the .ui names
-    // dew1 = heaterIdx 0, dew2 = heaterIdx 1
     const char* suffix = (heaterIdx == 0) ? "1" : "2";
 
     char szName[64];
     const char* kAutoWidgets[] = {
-        "label_dew%sAggCaption",
-        "spinBox_dew%sAggressiveness",
-        "label_dew%sAggHint",
-        "label_dew%sFallbackCaption",
-        "comboBox_dew%sFallback",
-        "label_dew%sAutoDutyCaption",
-        "label_dew%sAutoDuty",
+        "lblDew%sAggressivenessCaption",
+        "spinDew%sAggressiveness",
+        "lblDew%sAggressivenessHint",
+        "lblDew%sFallbackCaption",
+        "comboDew%sFallback",
+        "lblDew%sAutoDutyCaption",
+        "lblDew%sAutoDuty",
     };
-    const char* method = bAutoMode ? "show" : "hide";
 
     for (int i = 0; i < 7; ++i)
     {
         snprintf(szName, sizeof(szName), kAutoWidgets[i], suffix);
-        uiex->invokeMethod(szName, method);
+        uiex->setEnabled(szName, bAutoMode);
     }
 }
 
@@ -1743,7 +1796,7 @@ int X2Svbony241Pro::execModalSettingsDialog()
         if (uiex == NULL) { nErr = ERR_POINTER; break; }
 
         // --- Populate static labels ---
-        uiex->setText("label_connStatus",
+        uiex->setText("lblConnectionStatus",
                        m_bLinked ? "Connected" : "Not connected");
         // Show warmup progress during post-reset sensor warmup; otherwise the
         // usual OK / Read error / — status.
@@ -1762,8 +1815,8 @@ int X2Svbony241Pro::execModalSettingsDialog()
                              "Warming up… ready in %d s",
                              (kSensorWarmupMs / 1000) - secsElapsed);
                     szSensorStatus = szWarmupBuf;
-                    uiex->invokeMethod("progressBar_warmup", "show");
-                    uiex->setPropertyInt("progressBar_warmup", "value", secsElapsed);
+                    uiex->invokeMethod("progressWarmup", "show");
+                    uiex->setPropertyInt("progressWarmup", "value", secsElapsed);
                 }
             }
             if (!bInWarmup)
@@ -1771,22 +1824,22 @@ int X2Svbony241Pro::execModalSettingsDialog()
                 szSensorStatus =
                     m_bSensorValid              ? "OK"         :
                     (m_nLastDewUpdateTick != 0) ? "Read error" : "—";
-                uiex->invokeMethod("progressBar_warmup", "hide");
+                uiex->invokeMethod("progressWarmup", "hide");
             }
-            uiex->setText("label_sensorStatus", szSensorStatus);
+            uiex->setText("lblSensorStatus", szSensorStatus);
         }
 
         if (m_bLinked && m_bSensorValid)
         {
             char szBuf[64];
             snprintf(szBuf, sizeof(szBuf), "%.1f °C", m_dAmbientTempC);
-            uiex->setText("label_ambientTemp", szBuf);
+            uiex->setText("lblAmbientTemp", szBuf);
 
             snprintf(szBuf, sizeof(szBuf), "%.1f %%", m_dAmbientHumidityPct);
-            uiex->setText("label_humidity", szBuf);
+            uiex->setText("lblHumidity", szBuf);
 
             snprintf(szBuf, sizeof(szBuf), "%.1f °C", m_dDewPointC);
-            uiex->setText("label_dewPoint", szBuf);
+            uiex->setText("lblDewPoint", szBuf);
         }
 
         // Populate status labels from cache only — no serial I/O before exec().
@@ -1801,52 +1854,52 @@ int X2Svbony241Pro::execModalSettingsDialog()
 
             // INA219 — from cache (updated on the last TSX poll cycle)
             snprintf(szBuf, sizeof(szBuf), "%.2f V", m_dVoltageV);
-            uiex->setText("label_voltage", szBuf);
+            uiex->setText("lblVoltage", szBuf);
 
             snprintf(szBuf, sizeof(szBuf), "%.3f A", m_dCurrentA);
-            uiex->setText("label_current", szBuf);
+            uiex->setText("lblCurrent", szBuf);
 
-            // Lens temperature — from cache; "—" when probe absent
-            if (m_bLensTempValid)
+            // Hub temperature — SHT40 raw (self-heated); shown for diagnostics
+            if (m_bSensorValid)
             {
                 char szLens[32];
-                snprintf(szLens, sizeof(szLens), "%.1f °C", m_dLensTempC);
-                uiex->setText("label_lensTemp", szLens);
+                snprintf(szLens, sizeof(szLens), "%.1f °C", m_dHubTempC);
+                uiex->setText("lblLensTemp", szLens);
             }
             else
             {
-                uiex->setText("label_lensTemp", "—");
+                uiex->setText("lblLensTemp", "—");
             }
 
             // Port states from cache
-            const char* kDCLabels[] = { "label_dc1","label_dc2","label_dc3","label_dc4" };
+            const char* kDCLabels[] = { "lblDC1State","lblDC2State","lblDC3State","lblDC4State" };
             for (int i = 0; i < 4; ++i)
                 uiex->setText(kDCLabels[i], m_bCircuitState[i] ? "ON" : "OFF");
-            uiex->setText("label_usb",
+            uiex->setText("lblUSBState",
                            m_bCircuitState[6] ? "ON" : "OFF");
 
             if (m_bCircuitState[7])
             {
                 snprintf(szBuf, sizeof(szBuf), "%.1f V", m_dRegulatedVoltageV);
-                uiex->setText("label_regulated", szBuf);
+                uiex->setText("lblRegulatedState", szBuf);
             }
             else
             {
-                uiex->setText("label_regulated", "OFF");
+                uiex->setText("lblRegulatedState", "OFF");
             }
         }
 
         // --- Debug level ---
-        uiex->setCurrentIndex("comboBox_debugLevel", m_nDebugLevel);
+        uiex->setCurrentIndex("comboDebugLevel", m_nDebugLevel);
 
         // --- Dew heater settings ---
         for (int i = 0; i < 2; ++i)
         {
-            const char* modeCombo  = (i == 0) ? "comboBox_dew1Mode"         : "comboBox_dew2Mode";
-            const char* dutyBox    = (i == 0) ? "spinBox_dew1FixedDuty"     : "spinBox_dew2FixedDuty";
-            const char* aggBox     = (i == 0) ? "spinBox_dew1Aggressiveness" : "spinBox_dew2Aggressiveness";
-            const char* fallCombo  = (i == 0) ? "comboBox_dew1Fallback"     : "comboBox_dew2Fallback";
-            const char* autoDuty   = (i == 0) ? "label_dew1AutoDuty"        : "label_dew2AutoDuty";
+            const char* modeCombo  = (i == 0) ? "comboDew1Mode"          : "comboDew2Mode";
+            const char* dutyBox    = (i == 0) ? "spinDew1FixedDuty"      : "spinDew2FixedDuty";
+            const char* aggBox     = (i == 0) ? "spinDew1Aggressiveness" : "spinDew2Aggressiveness";
+            const char* fallCombo  = (i == 0) ? "comboDew1Fallback"      : "comboDew2Fallback";
+            const char* autoDuty   = (i == 0) ? "lblDew1AutoDuty"        : "lblDew2AutoDuty";
 
             uiex->setCurrentIndex(modeCombo,
                                   (m_eDewMode[i] == DEW_MODE_AUTO) ? 1 : 0);
@@ -1857,19 +1910,30 @@ int X2Svbony241Pro::execModalSettingsDialog()
 
             // Show/hide auto-only rows
             bool bAuto = (m_eDewMode[i] == DEW_MODE_AUTO);
-            setDewAutoRowsVisible(uiex, i, bAuto);
+            setDewAutoRowsEnabled(uiex, i, bAuto);
 
-            // Computed duty label
-            if (bAuto && m_bSensorValid)
+            // Computed/actual duty label
+            if (bAuto)
             {
-                char szBuf[32];
-                snprintf(szBuf, sizeof(szBuf), "%d %%", calcAutoDutyPct(i));
+                char szBuf[64];
+                if (!m_bCircuitState[4 + i])
+                {
+                    snprintf(szBuf, sizeof(szBuf), "OFF");
+                }
+                else if (m_nLastSentDutyPct[i] >= 0)
+                {
+                    snprintf(szBuf, sizeof(szBuf), "%d%% (sent)", m_nLastSentDutyPct[i]);
+                }
+                else
+                {
+                    snprintf(szBuf, sizeof(szBuf), "%d%% (computed)", calcAutoDutyPct(i));
+                }
                 uiex->setText(autoDuty, szBuf);
             }
         }
 
         // --- Adjustable voltage spinbox ---
-        uiex->setPropertyDouble("doubleSpinBox_regulatedVoltage", "value", m_dRegulatedVoltageV);
+        uiex->setPropertyDouble("dblSpinRegulatedVoltage", "value", m_dRegulatedVoltageV);
 
         nErr = pUI->exec(bPressedOK);
         if (nErr) break;
@@ -1879,10 +1943,10 @@ int X2Svbony241Pro::execModalSettingsDialog()
             // Read back dew heater settings and persist
             for (int i = 0; i < 2; ++i)
             {
-                const char* modeCombo = (i == 0) ? "comboBox_dew1Mode"          : "comboBox_dew2Mode";
-                const char* dutyBox   = (i == 0) ? "spinBox_dew1FixedDuty"      : "spinBox_dew2FixedDuty";
-                const char* aggBox    = (i == 0) ? "spinBox_dew1Aggressiveness"  : "spinBox_dew2Aggressiveness";
-                const char* fallCombo = (i == 0) ? "comboBox_dew1Fallback"      : "comboBox_dew2Fallback";
+                const char* modeCombo = (i == 0) ? "comboDew1Mode"          : "comboDew2Mode";
+                const char* dutyBox   = (i == 0) ? "spinDew1FixedDuty"      : "spinDew2FixedDuty";
+                const char* aggBox    = (i == 0) ? "spinDew1Aggressiveness"  : "spinDew2Aggressiveness";
+                const char* fallCombo = (i == 0) ? "comboDew1Fallback"      : "comboDew2Fallback";
 
                 m_eDewMode[i]           = (uiex->currentIndex(modeCombo) == 1)
                                           ? DEW_MODE_AUTO : DEW_MODE_MANUAL;
@@ -1904,7 +1968,7 @@ int X2Svbony241Pro::execModalSettingsDialog()
 
             // Adjustable voltage output
             double dVoltage = m_dRegulatedVoltageV;
-            uiex->propertyDouble("doubleSpinBox_regulatedVoltage", "value", dVoltage);
+            uiex->propertyDouble("dblSpinRegulatedVoltage", "value", dVoltage);
             if (dVoltage < 0.0)  dVoltage = 0.0;
             if (dVoltage > 15.3) dVoltage = 15.3;
             m_dRegulatedVoltageV = dVoltage;
@@ -1917,7 +1981,7 @@ int X2Svbony241Pro::execModalSettingsDialog()
             }
 
             // Debug level
-            int nDbg = uiex->currentIndex("comboBox_debugLevel");
+            int nDbg = uiex->currentIndex("comboDebugLevel");
             if (nDbg < kDebugOff)    nDbg = kDebugOff;
             if (nDbg > kDebugFullIO) nDbg = kDebugFullIO;
             m_nDebugLevel = nDbg;
@@ -1946,7 +2010,7 @@ int X2Svbony241Pro::execModalSettingsDialog()
 // "on_timer"
 //     Refresh the live-data labels: port states, sensor readings, computed duty.
 //
-// "on_comboBox_dew{1,2}Mode_currentIndexChanged"
+// "on_comboDew{1,2}Mode_currentIndexChanged"
 //     Show or hide the auto-only rows depending on selected mode.
 // ---------------------------------------------------------------------------
 void X2Svbony241Pro::uiEvent(X2GUIExchangeInterface* uiex, const char* pszEvent)
@@ -1959,7 +2023,7 @@ void X2Svbony241Pro::uiEvent(X2GUIExchangeInterface* uiex, const char* pszEvent)
     // Touching the port here would block the TSX UI thread.
     if (!strcmp(pszEvent, "on_timer"))
     {
-        uiex->setText("label_connStatus", m_bLinked ? "Connected" : "Not connected");
+        uiex->setText("lblConnectionStatus", m_bLinked ? "Connected" : "Not connected");
 
         if (!m_bLinked)
             return;
@@ -1983,8 +2047,8 @@ void X2Svbony241Pro::uiEvent(X2GUIExchangeInterface* uiex, const char* pszEvent)
                              "Warming up… ready in %d s",
                              (kSensorWarmupMs / 1000) - secsElapsed);
                     szSensorStatus = szWarmupBuf;
-                    uiex->invokeMethod("progressBar_warmup", "show");
-                    uiex->setPropertyInt("progressBar_warmup", "value", secsElapsed);
+                    uiex->invokeMethod("progressWarmup", "show");
+                    uiex->setPropertyInt("progressWarmup", "value", secsElapsed);
                 }
             }
             if (!bInWarmup)
@@ -2007,9 +2071,9 @@ void X2Svbony241Pro::uiEvent(X2GUIExchangeInterface* uiex, const char* pszEvent)
                 szSensorStatus =
                     m_bSensorValid              ? "OK"         :
                     (m_nLastDewUpdateTick != 0) ? "Read error" : "—";
-                uiex->invokeMethod("progressBar_warmup", "hide");
+                uiex->invokeMethod("progressWarmup", "hide");
             }
-            uiex->setText("label_sensorStatus", szSensorStatus);
+            uiex->setText("lblSensorStatus", szSensorStatus);
         }
 
         // Environmental sensor labels — from cache
@@ -2017,70 +2081,74 @@ void X2Svbony241Pro::uiEvent(X2GUIExchangeInterface* uiex, const char* pszEvent)
         if (m_bSensorValid)
         {
             snprintf(szBuf, sizeof(szBuf), "%.1f °C", m_dAmbientTempC);
-            uiex->setText("label_ambientTemp", szBuf);
+            uiex->setText("lblAmbientTemp", szBuf);
 
             snprintf(szBuf, sizeof(szBuf), "%.1f %%", m_dAmbientHumidityPct);
-            uiex->setText("label_humidity", szBuf);
+            uiex->setText("lblHumidity", szBuf);
 
             snprintf(szBuf, sizeof(szBuf), "%.1f °C", m_dDewPointC);
-            uiex->setText("label_dewPoint", szBuf);
+            uiex->setText("lblDewPoint", szBuf);
         }
         else
         {
-            uiex->setText("label_ambientTemp", "—");
-            uiex->setText("label_humidity",    "—");
-            uiex->setText("label_dewPoint",    "—");
+            uiex->setText("lblAmbientTemp", "—");
+            uiex->setText("lblHumidity",    "—");
+            uiex->setText("lblDewPoint",    "—");
         }
 
         // INA219 — from cache
         snprintf(szBuf, sizeof(szBuf), "%.2f V", m_dVoltageV);
-        uiex->setText("label_voltage", szBuf);
+        uiex->setText("lblVoltage", szBuf);
         snprintf(szBuf, sizeof(szBuf), "%.3f A", m_dCurrentA);
-        uiex->setText("label_current", szBuf);
+        uiex->setText("lblCurrent", szBuf);
 
-        // Lens temp — from cache (updated each poll; "—" when probe absent)
-        if (m_bLensTempValid)
+        // Hub temp (SHT40 raw, self-heated) — shown for diagnostics
+        if (m_bSensorValid)
         {
-            snprintf(szBuf, sizeof(szBuf), "%.1f °C", m_dLensTempC);
-            uiex->setText("label_lensTemp", szBuf);
+            snprintf(szBuf, sizeof(szBuf), "%.1f °C", m_dHubTempC);
+            uiex->setText("lblLensTemp", szBuf);
         }
         else
         {
-            uiex->setText("label_lensTemp", "—");
+            uiex->setText("lblLensTemp", "—");
         }
 
         // DC port on/off states — from cache
-        const char* kDCLabels[] = { "label_dc1","label_dc2","label_dc3","label_dc4" };
+        const char* kDCLabels[] = { "lblDC1State","lblDC2State","lblDC3State","lblDC4State" };
         for (int i = 0; i < 4; ++i)
             uiex->setText(kDCLabels[i], m_bCircuitState[i] ? "ON" : "OFF");
 
-        uiex->setText("label_usb", m_bCircuitState[6] ? "ON" : "OFF");
+        uiex->setText("lblUSBState", m_bCircuitState[6] ? "ON" : "OFF");
 
         if (m_bCircuitState[7])
         {
             snprintf(szBuf, sizeof(szBuf), "%.1f V", m_dRegulatedVoltageV);
-            uiex->setText("label_regulated", szBuf);
+            uiex->setText("lblRegulatedState", szBuf);
         }
         else
         {
-            uiex->setText("label_regulated", "OFF");
+            uiex->setText("lblRegulatedState", "OFF");
         }
 
-        // Auto dew computed duty labels — from cache (pure computation, no I/O)
+        // Auto dew actual/computed duty labels — updated from cache on each timer tick
         for (int i = 0; i < 2; ++i)
         {
-            const char* autoDutyLabel = (i == 0) ? "label_dew1AutoDuty" : "label_dew2AutoDuty";
+            const char* autoDutyLabel = (i == 0) ? "lblDew1AutoDuty" : "lblDew2AutoDuty";
             if (m_eDewMode[i] == DEW_MODE_AUTO)
             {
-                if (m_bSensorValid)
+                if (!m_bCircuitState[4 + i])
                 {
-                    snprintf(szBuf, sizeof(szBuf), "%d %%", calcAutoDutyPct(i));
+                    uiex->setText(autoDutyLabel, "OFF");
+                }
+                else if (m_nLastSentDutyPct[i] >= 0)
+                {
+                    snprintf(szBuf, sizeof(szBuf), "%d%% (sent)", m_nLastSentDutyPct[i]);
                     uiex->setText(autoDutyLabel, szBuf);
                 }
                 else
                 {
-                    uiex->setText(autoDutyLabel,
-                        (m_eDewFallback[i] == DEW_FALLBACK_ON) ? "fallback ON" : "fallback OFF");
+                    snprintf(szBuf, sizeof(szBuf), "%d%% (computed)", calcAutoDutyPct(i));
+                    uiex->setText(autoDutyLabel, szBuf);
                 }
             }
         }
@@ -2088,18 +2156,18 @@ void X2Svbony241Pro::uiEvent(X2GUIExchangeInterface* uiex, const char* pszEvent)
         return;
     }
 
-    // ── Mode combo changed: toggle auto-only row visibility ───────────────
-    if (!strcmp(pszEvent, "on_comboBox_dew1Mode_currentIndexChanged"))
+    // ── Mode combo changed: enable/disable auto-only rows immediately ────────
+    if (!strcmp(pszEvent, "on_comboDew1Mode_currentIndexChanged"))
     {
-        bool bAuto = (uiex->currentIndex("comboBox_dew1Mode") == 1);
-        setDewAutoRowsVisible(uiex, 0, bAuto);
+        bool bAuto = (uiex->currentIndex("comboDew1Mode") == 1);
+        setDewAutoRowsEnabled(uiex, 0, bAuto);
         return;
     }
 
-    if (!strcmp(pszEvent, "on_comboBox_dew2Mode_currentIndexChanged"))
+    if (!strcmp(pszEvent, "on_comboDew2Mode_currentIndexChanged"))
     {
-        bool bAuto = (uiex->currentIndex("comboBox_dew2Mode") == 1);
-        setDewAutoRowsVisible(uiex, 1, bAuto);
+        bool bAuto = (uiex->currentIndex("comboDew2Mode") == 1);
+        setDewAutoRowsEnabled(uiex, 1, bAuto);
         return;
     }
 }

@@ -173,3 +173,75 @@ Bump `PLUGIN_VERSION_MAJOR` manually only for significant or breaking changes.
 
 4. Restart TheSkyX. The **SVBony SV241 Pro** entry will appear in
    **Telescope > Power Control Box**.
+
+---
+
+## Agent Directives & Lessons Learned
+
+Hard-won lessons from development. Read these before making changes.
+
+### Build system
+- **Always use `make clean && make install`** — never cmake.
+- Confirm zero warnings and zero errors before reporting done.
+- The install script prints `UI OK.` after XML validation — missing means
+  the .ui file is malformed.
+
+### UI file strict rules
+
+**Widget naming convention** (descriptive camelCase with type prefix):
+
+| Prefix     | Widget type       |
+|------------|-------------------|
+| `lbl`      | QLabel            |
+| `spin`     | QSpinBox          |
+| `dblSpin`  | QDoubleSpinBox    |
+| `combo`    | QComboBox         |
+| `btn`      | QPushButton       |
+| `grp`      | QGroupBox         |
+| `progress` | QProgressBar      |
+| `chk`      | QCheckBox         |
+
+Layouts and spacers use plain descriptive names (`layoutMain`, `spacerButtons`) with no type prefix.
+
+**Exception — OK/Cancel buttons must keep their framework names.**
+TheSkyX's X2GUI framework locates accept/reject buttons by the hardcoded names
+`pushButtonOK` and `pushButtonCancel`. Renaming them causes `pUI->exec()` to
+never set `bPressedOK = true` — the button appears to do nothing. Do not rename
+these two, even during a blanket widget-rename pass.
+
+**No QScrollArea.** Wrapping dialog content in a `QScrollArea` crashes TheSkyX
+when OK is clicked. The `QUiLoader`-based X2GUI framework does not survive the
+extra container layer during dialog teardown.
+
+**uiEvent event names derive from widget object names.** When a widget is
+renamed, update the corresponding `strcmp` in `uiEvent()` to match:
+`"on_<objectName>_<signal>"`. E.g. renaming `comboBox_dew1Mode` →
+`comboDew1Mode` requires changing `"on_comboBox_dew1Mode_currentIndexChanged"`
+→ `"on_comboDew1Mode_currentIndexChanged"`.
+
+### Sensor decoding
+
+All sensor commands use the firmware encoding `wire_value = (physical + offset) × 100`
+(big-endian uint32). Offsets: SHT40 temp/RH = 254.0, DS18B20 = 255.5.
+**Do not use the raw DS18B20 datasheet formula (int16 × 0.0625)** — it gives
+~800 °C. **Do not use the SHT40 native ADC formula** — firmware does not send
+raw ADC counts.
+
+SHT40 is mounted inside the powered hub and self-heats ~5–6 °C above ambient.
+The RH reading is empirically close to true ambient RH (enclosure is not sealed).
+**Do not apply a Magnus Psat correction to SHT40 RH** — it overcorrects
+(observed: ~52 % → ~74 %). Use DS18B20 temperature + SHT40 RH as inputs to
+`calcDewPoint()` when DS18B20 is valid. Set `m_dAmbientTempC` before calling
+`calcDewPoint()` so the dew-point uses the correct temperature.
+
+### What didn't work
+
+| Approach | Why it failed |
+|---|---|
+| `QScrollArea` in dialog | TSX crashes on OK click — X2GUI can't handle extra container during teardown |
+| Renaming `pushButtonOK`/`pushButtonCancel` | X2 framework hardcodes these names; OK appears broken |
+| Magnus Psat correction on SHT40 RH | SHT40 reads ambient RH correctly in open enclosure; correction overcorrects |
+| DS18B20 decode as int16 × 0.0625 | Firmware uses offset encoding, not raw register; result ~800 °C |
+| Blocking `nanosleep` in `establishLink()` | Makes connect hang 5–15 s; use async warmup guard instead |
+| SHT40 native ADC formula | Firmware uses offset encoding, not raw ADC counts |
+| Calling `updateDewControl()` before warmup guard | Caches sentinel/garbage values during 15 s boot window |
