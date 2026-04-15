@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# install.sh — Build and install the SVBony SV241 Pro plugin for TheSkyX
+# install.sh — Install the SVBony SV241 Pro plugin for TheSkyX
 #
 # Usage:
-#   ./install.sh           # build and install
+#   ./install.sh              # install (build first with: make clean && make)
 #   ./install.sh --uninstall  # remove installed files
 #
 # No sudo is required if you own the TheSkyX app bundle (typical single-user install).
@@ -72,16 +72,8 @@ if [[ ! -f "${SCRIPT_DIR}/${LIST_FILE}" ]]; then
     exit 1
 fi
 
-# ---------------------------------------------------------------------------
-# Build
-# ---------------------------------------------------------------------------
-echo "Building ${LIB_NAME}..."
-cd "${SCRIPT_DIR}"
-make clean
-make
-
-if [[ ! -f "${LIB_NAME}" ]]; then
-    echo "ERROR: Build failed — ${LIB_NAME} not found." >&2
+if [[ ! -f "${SCRIPT_DIR}/${LIB_NAME}" ]]; then
+    echo "ERROR: ${LIB_NAME} not found — run 'make clean && make' first." >&2
     exit 1
 fi
 
@@ -90,13 +82,13 @@ fi
 # ---------------------------------------------------------------------------
 echo "Installing plugin..."
 
-cp "${LIB_NAME}" "${PLUGIN_DIR}/${LIB_NAME}"
+cp "${SCRIPT_DIR}/${LIB_NAME}" "${PLUGIN_DIR}/${LIB_NAME}"
 echo "  -> ${PLUGIN_DIR}/${LIB_NAME}"
 
-cp "${UI_FILE}" "${PLUGIN_DIR}/${UI_FILE}"
+cp "${SCRIPT_DIR}/${UI_FILE}" "${PLUGIN_DIR}/${UI_FILE}"
 echo "  -> ${PLUGIN_DIR}/${UI_FILE}"
 
-cp "${LIST_FILE}" "${LIST_DIR}/${LIST_FILE}"
+cp "${SCRIPT_DIR}/${LIST_FILE}" "${LIST_DIR}/${LIST_FILE}"
 echo "  -> ${LIST_DIR}/${LIST_FILE}"
 
 echo ""
