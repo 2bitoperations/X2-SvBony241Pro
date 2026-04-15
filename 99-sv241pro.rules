@@ -1,0 +1,14 @@
+# udev rule for SVBony SV241 Pro USB Power Hub
+#
+# The SV241 Pro uses a QinHeng CH340/CH341 USB-UART bridge:
+#   idVendor  = 1a86  (QinHeng Electronics)
+#   idProduct = 7523  (CH340 serial converter)
+#
+# This rule creates a stable symlink /dev/ttyUSBSV241Pro so that the device
+# path does not change between reboots or re-plugs.
+#
+# If you have other CH340/CH341 devices connected at the same time, add a
+# ATTRS{serial}=="<your-serial>" clause to distinguish them.  See README.md
+# for instructions on finding the serial number with `udevadm info`.
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="ttyUSBSV241Pro"

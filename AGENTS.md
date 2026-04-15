@@ -245,3 +245,5 @@ The RH reading is empirically close to true ambient RH (enclosure is not sealed)
 | Blocking `nanosleep` in `establishLink()` | Makes connect hang 5–15 s; use async warmup guard instead |
 | SHT40 native ADC formula | Firmware uses offset encoding, not raw ADC counts |
 | Calling `updateDewControl()` before warmup guard | Caches sentinel/garbage values during 15 s boot window |
+| Setting `geometry` or `minimumSize` in `sv241pro.ui` | TheSkyX's `X2ModalUIUtil` ignores the `geometry` property entirely and appears to ignore `minimumSize` too. Dialog size is controlled internally by the X2GUI framework. The dialog renders "tall and skinny" regardless of what the `.ui` file requests. |
+| `QHBoxLayout` two-column layout in dialog | After the QScrollArea crash, a two-column `QHBoxLayout(layoutColumns)` was tried. TheSkyX's `QUiLoader` may not render this correctly — the dialog still appeared as a single narrow column. The framework's `QUiLoader` has limited layout support. |

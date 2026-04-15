@@ -169,6 +169,18 @@
               </widget>
              </item>
 
+             <item row="2" column="0">
+              <widget class="QLabel" name="lblPowerCaption">
+               <property name="text"><string>Power :</string></property>
+               <property name="alignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+              </widget>
+             </item>
+             <item row="2" column="1">
+              <widget class="QLabel" name="lblPower">
+               <property name="text"><string>—</string></property>
+              </widget>
+             </item>
+
             </layout>
            </widget>
           </item>
@@ -482,6 +494,23 @@ Errors always logged to ~/TheSkyX/x2svbony241pro.log</string></property>
                <item><property name="text"><string>Errors only</string></property></item>
                <item><property name="text"><string>Commands</string></property></item>
                <item><property name="text"><string>Full I/O</string></property></item>
+              </widget>
+             </item>
+            </layout>
+           </widget>
+          </item>
+
+          <!-- Startup Options -->
+          <item>
+           <widget class="QGroupBox" name="grpOptions">
+            <property name="title"><string>Startup Options</string></property>
+            <layout class="QVBoxLayout" name="layoutOptions">
+             <item>
+              <widget class="QCheckBox" name="chkRestoreOnConnect">
+               <property name="text"><string>Restore circuit states on connect</string></property>
+               <property name="toolTip"><string>When checked, all circuit on/off states saved at last disconnect will be
+re-applied after a successful connection is established.
+Dew heater modes, duty cycles, and auto settings are always restored.</string></property>
               </widget>
              </item>
             </layout>

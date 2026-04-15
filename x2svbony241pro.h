@@ -285,6 +285,14 @@ private:
     void            saveDebugLevel();
     void            loadDebugLevel();
 
+    // Save the current on/off state of every circuit + the RestoreOnConnect flag.
+    // Called from terminateLink() so the last known state survives a disconnect.
+    void            saveCircuitStates();
+
+    // Read ini-persisted circuit states and apply them to the device.
+    // Only called when m_bRestoreOnConnect is true, after link is established.
+    void            restoreCircuitStates();
+
     // Log helper: only writes if m_nDebugLevel >= minLevel.
     // minLevel: 1=Errors only, 2=Commands, 3=Full I/O
     void            logDebug(int minLevel, const char* fmt, ...) const;
@@ -344,4 +352,8 @@ private:
     // reads until kSensorWarmupMs have elapsed from this point.
     // Zero means no reset has been performed since construction.
     int             m_nResetTimeTick;
+
+    // If true, re-apply the last saved circuit on/off states after establishLink().
+    // Persisted as RestoreOnConnect_N in the ini store.
+    bool            m_bRestoreOnConnect;
 };

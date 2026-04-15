@@ -130,6 +130,10 @@ X2Svbony241Pro::X2Svbony241Pro(
     , m_nLastDewUpdateTick      (0)
     , m_nLastDialogSensorTick  (0)
     , m_nResetTimeTick          (0)
+    // NOTE: initializer list order matches member declaration order in the header.
+    // C++ initialises in declaration order, not initialiser-list order; keeping
+    // them consistent prevents subtle bugs if a later field ever depends on an earlier one.
+    , m_bRestoreOnConnect       (false)
 {
     (void)pszDisplayName;   // display name is managed by TheSkyX
 
@@ -490,6 +494,11 @@ int X2Svbony241Pro::establishLink()
 
     parseStateResponse(state10);
 
+    // Restore last saved circuit states if the user has enabled that option.
+    // Done after parseStateResponse() so m_bCircuitState[] reflects the device's
+    // actual current state before we layer the saved state on top.
+    restoreCircuitStates();
+
     int nTotalMs = m_pTickCount ? (m_pTickCount->elapsed() - nLinkStartTick) : -1;
     logDebug(kDebugErrors, "X2Svbony241Pro: link established (total=%d ms)", nTotalMs);
 
@@ -500,6 +509,7 @@ int X2Svbony241Pro::terminateLink()
 {
     saveDebugLevel();
     saveDewConfig();
+    saveCircuitStates();
 
     // Clear m_bLinked and close the port under the mutex.  Any thread that is
     // blocked waiting to acquire the lock inside sendFrame() will re-check
@@ -1287,6 +1297,10 @@ uint8_t X2Svbony241Pro::onValueForCircuit(int nCircuit) const
 // ---------------------------------------------------------------------------
 void X2Svbony241Pro::parseStateResponse(const uint8_t* pState10)
 {
+    // PRECONDITION: pState10 points to at least 10 valid bytes as returned by
+    // cmdGetState().  All callers in this file guarantee this — do not call
+    // with a shorter buffer.
+
     // DC ports 1-4 (circuits 0-3).  Device has a 5th DC port (pState10[4])
     // which we do not expose in the X2 circuit map.
     m_bCircuitState[0] = (pState10[0] != 0);
@@ -1460,15 +1474,21 @@ int X2Svbony241Pro::updateDewControl(bool bForce)
 
     // Skip sensor reads during post-reset sensor warmup period.
     // The ESP32 returns sentinel values for ~15s after a hardware reset.
-    if (m_nResetTimeTick > 0 && m_pTickCount)
+    // Snapshot m_nResetTimeTick once — terminateLink() can clear it from another
+    // thread, and a snapshot avoids a TOCTOU race.
     {
-        int msSinceReset = m_pTickCount->elapsed() - m_nResetTimeTick;
-        if (msSinceReset < kSensorWarmupMs)
+        int nResetTick = m_nResetTimeTick;  // thread-safe snapshot
+        if (nResetTick > 0 && m_pTickCount)
         {
-            logDebug(kDebugCommands,
-                     "X2Svbony241Pro: sensor warmup in progress (%d ms / %d ms)",
-                     msSinceReset, kSensorWarmupMs);
-            return SB_OK;  // don't stamp m_nLastDewUpdateTick; allow retry on next poll
+            int msSinceReset = m_pTickCount->elapsed() - nResetTick;
+            if (msSinceReset < 0) msSinceReset = kSensorWarmupMs;  // wrap-safe
+            if (msSinceReset < kSensorWarmupMs)
+            {
+                logDebug(kDebugCommands,
+                         "X2Svbony241Pro: sensor warmup in progress (%d ms / %d ms)",
+                         msSinceReset, kSensorWarmupMs);
+                return SB_OK;  // don't stamp m_nLastDewUpdateTick; allow retry on next poll
+            }
         }
     }
 
@@ -1478,10 +1498,13 @@ int X2Svbony241Pro::updateDewControl(bool bForce)
     // elapsed() returns int (ms since TSX started).  Use int throughout to
     // avoid signed/unsigned comparison pitfalls and to match the interface type.
     int now = m_pTickCount ? m_pTickCount->elapsed() : 0;
-    if (!bForce &&
-        m_nLastDewUpdateTick != 0 &&
-        (now - m_nLastDewUpdateTick) < kDewUpdateIntervalMs)
-        return SB_OK;
+    if (!bForce && m_nLastDewUpdateTick != 0)
+    {
+        int sinceUpdate = now - m_nLastDewUpdateTick;
+        if (sinceUpdate < 0) sinceUpdate = kDewUpdateIntervalMs;  // wrap-safe
+        if (sinceUpdate < kDewUpdateIntervalMs)
+            return SB_OK;
+    }
 
     // --- Read all sensors ---
     // Read order: DS18B20 first so its value is available when we compute the
@@ -1567,12 +1590,13 @@ int X2Svbony241Pro::updateDewControl(bool bForce)
 
     // INA219 — non-fatal if unavailable; update cache on success.
     {
-        double v = 0.0, a = 0.0;
+        double v = 0.0, a = 0.0, p = 0.0;
         if (cmdReadVoltage(v) == SB_OK && v > 1.0)  m_dVoltageV = v;
         if (cmdReadCurrent(a) == SB_OK)              m_dCurrentA = a;
+        if (cmdReadPower(p)   == SB_OK)              m_dPowerW   = p;
         logDebug(kDebugCommands,
-                 "X2Svbony241Pro: INA219 — %.2f V  %.3f A",
-                 m_dVoltageV, m_dCurrentA);
+                 "X2Svbony241Pro: INA219 — %.2f V  %.3f A  %.2f W",
+                 m_dVoltageV, m_dCurrentA, m_dPowerW);
     }
 
     // --- Apply auto PWM to each heater that is on and in auto mode ---
@@ -1725,10 +1749,15 @@ void X2Svbony241Pro::loadDewConfig()
     if (nVal > 153) nVal = 153;
     m_dRegulatedVoltageV = static_cast<double>(nVal) / 10.0;
 
+    // Restore-on-connect flag
+    snprintf(szKey, sizeof(szKey), "RestoreOnConnect_%d", m_nInstanceIndex);
+    m_bRestoreOnConnect = (m_pIniUtil->readInt(kIniSection, szKey, 0) != 0);
+
     logDebug(kDebugCommands,
              "X2Svbony241Pro: dew config loaded — "
              "H1 mode=%s agg=%d fallback=%s fixed=%d%%  "
-             "H2 mode=%s agg=%d fallback=%s fixed=%d%%",
+             "H2 mode=%s agg=%d fallback=%s fixed=%d%%  "
+             "restoreOnConnect=%s",
              m_eDewMode[0] == DEW_MODE_AUTO ? "AUTO" : "MANUAL",
              m_nDewAggressiveness[0],
              m_eDewFallback[0] == DEW_FALLBACK_ON ? "ON" : "OFF",
@@ -1736,7 +1765,65 @@ void X2Svbony241Pro::loadDewConfig()
              m_eDewMode[1] == DEW_MODE_AUTO ? "AUTO" : "MANUAL",
              m_nDewAggressiveness[1],
              m_eDewFallback[1] == DEW_FALLBACK_ON ? "ON" : "OFF",
-             m_nDewFixedDutyPct[1]);
+             m_nDewFixedDutyPct[1],
+             m_bRestoreOnConnect ? "YES" : "NO");
+}
+
+// ---------------------------------------------------------------------------
+// saveCircuitStates
+//
+// Persists the RestoreOnConnect flag and the current on/off state of every
+// X2 circuit so they can be reapplied by restoreCircuitStates() on the next
+// connect.  Called from terminateLink() and from the dialog OK handler.
+// ---------------------------------------------------------------------------
+void X2Svbony241Pro::saveCircuitStates()
+{
+    if (m_pIniUtil == NULL)
+        return;
+
+    char szKey[64];
+    snprintf(szKey, sizeof(szKey), "RestoreOnConnect_%d", m_nInstanceIndex);
+    m_pIniUtil->writeInt(kIniSection, szKey, m_bRestoreOnConnect ? 1 : 0);
+
+    for (int i = 0; i < X2_NUM_CIRCUITS; ++i)
+    {
+        snprintf(szKey, sizeof(szKey), "SavedCircuitState%d_%d", i, m_nInstanceIndex);
+        m_pIniUtil->writeInt(kIniSection, szKey, m_bCircuitState[i] ? 1 : 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// restoreCircuitStates
+//
+// Reads the saved circuit on/off states from the ini store and applies any
+// that differ from the device's current state.  Only called when
+// m_bRestoreOnConnect is true, after the link is established and the device's
+// actual state has been read into m_bCircuitState[] via parseStateResponse().
+//
+// Uses setCircuitState() for each circuit so auto-dew logic runs correctly
+// for heaters in DEW_MODE_AUTO.
+// ---------------------------------------------------------------------------
+void X2Svbony241Pro::restoreCircuitStates()
+{
+    if (!m_bRestoreOnConnect || m_pIniUtil == NULL)
+        return;
+
+    logDebug(kDebugErrors, "X2Svbony241Pro: restoring saved circuit states");
+
+    char szKey[64];
+    for (int i = 0; i < X2_NUM_CIRCUITS; ++i)
+    {
+        snprintf(szKey, sizeof(szKey), "SavedCircuitState%d_%d", i, m_nInstanceIndex);
+        bool bWasOn = (m_pIniUtil->readInt(kIniSection, szKey, 0) != 0);
+
+        if (bWasOn == m_bCircuitState[i])
+            continue;   // device already in the desired state; no command needed
+
+        logDebug(kDebugErrors,
+                 "X2Svbony241Pro: restore circuit %d (%s) → %s",
+                 i, kCircuitNames[i], bWasOn ? "ON" : "OFF");
+        setCircuitState(i, bWasOn);
+    }
 }
 
 // ===========================================================================
@@ -1802,11 +1889,14 @@ int X2Svbony241Pro::execModalSettingsDialog()
         // usual OK / Read error / — status.
         {
             char szWarmupBuf[64];
-            const char* szSensorStatus;
+            const char* szSensorStatus = "—";  // safe default; always overwritten below
             bool bInWarmup = false;
-            if (m_nResetTimeTick > 0 && m_pTickCount)
+            // Snapshot m_nResetTimeTick — terminateLink() can clear it concurrently.
+            int nResetTick = m_nResetTimeTick;
+            if (nResetTick > 0 && m_pTickCount)
             {
-                int msSinceReset = m_pTickCount->elapsed() - m_nResetTimeTick;
+                int msSinceReset = m_pTickCount->elapsed() - nResetTick;
+                if (msSinceReset < 0) msSinceReset = kSensorWarmupMs;  // wrap-safe
                 if (msSinceReset < kSensorWarmupMs)
                 {
                     bInWarmup = true;
@@ -1858,6 +1948,9 @@ int X2Svbony241Pro::execModalSettingsDialog()
 
             snprintf(szBuf, sizeof(szBuf), "%.3f A", m_dCurrentA);
             uiex->setText("lblCurrent", szBuf);
+
+            snprintf(szBuf, sizeof(szBuf), "%.2f W", m_dPowerW);
+            uiex->setText("lblPower", szBuf);
 
             // Hub temperature — SHT40 raw (self-heated); shown for diagnostics
             if (m_bSensorValid)
@@ -1935,6 +2028,9 @@ int X2Svbony241Pro::execModalSettingsDialog()
         // --- Adjustable voltage spinbox ---
         uiex->setPropertyDouble("dblSpinRegulatedVoltage", "value", m_dRegulatedVoltageV);
 
+        // --- Startup options ---
+        uiex->setChecked("chkRestoreOnConnect", m_bRestoreOnConnect);
+
         nErr = pUI->exec(bPressedOK);
         if (nErr) break;
 
@@ -1986,8 +2082,12 @@ int X2Svbony241Pro::execModalSettingsDialog()
             if (nDbg > kDebugFullIO) nDbg = kDebugFullIO;
             m_nDebugLevel = nDbg;
 
+            // Startup options
+            m_bRestoreOnConnect = uiex->isChecked("chkRestoreOnConnect");
+
             saveDebugLevel();
             saveDewConfig();
+            saveCircuitStates();
 
             // Force an immediate auto-control update so the new settings take effect now
             if (m_bLinked)
@@ -2034,11 +2134,14 @@ void X2Svbony241Pro::uiEvent(X2GUIExchangeInterface* uiex, const char* pszEvent)
         // rate here (bForce=true) so readings stay fresh while the dialog is open.
         {
             char szWarmupBuf[64];
-            const char* szSensorStatus;
+            const char* szSensorStatus = "—";  // safe default; always overwritten below
             bool bInWarmup = false;
-            if (m_nResetTimeTick > 0 && m_pTickCount)
+            // Snapshot m_nResetTimeTick — terminateLink() can clear it concurrently.
+            int nResetTick = m_nResetTimeTick;
+            if (nResetTick > 0 && m_pTickCount)
             {
-                int msSinceReset = m_pTickCount->elapsed() - m_nResetTimeTick;
+                int msSinceReset = m_pTickCount->elapsed() - nResetTick;
+                if (msSinceReset < 0) msSinceReset = kSensorWarmupMs;  // wrap-safe
                 if (msSinceReset < kSensorWarmupMs)
                 {
                     bInWarmup = true;
@@ -2059,8 +2162,9 @@ void X2Svbony241Pro::uiEvent(X2GUIExchangeInterface* uiex, const char* pszEvent)
                 // bForce=true bypasses the 30 s rate limit but does NOT reset
                 // m_nLastDewUpdateTick, so the background clock is undisturbed.
                 int nowTick = m_pTickCount ? m_pTickCount->elapsed() : 0;
-                if (m_nLastDialogSensorTick == 0 ||
-                    (nowTick - m_nLastDialogSensorTick) >= kDialogPollIntervalMs)
+                int sinceDialogPoll = nowTick - m_nLastDialogSensorTick;
+                if (sinceDialogPoll < 0) sinceDialogPoll = kDialogPollIntervalMs;  // wrap-safe
+                if (m_nLastDialogSensorTick == 0 || sinceDialogPoll >= kDialogPollIntervalMs)
                 {
                     m_nLastDialogSensorTick = nowTick;
                     logDebug(kDebugCommands,
@@ -2101,6 +2205,8 @@ void X2Svbony241Pro::uiEvent(X2GUIExchangeInterface* uiex, const char* pszEvent)
         uiex->setText("lblVoltage", szBuf);
         snprintf(szBuf, sizeof(szBuf), "%.3f A", m_dCurrentA);
         uiex->setText("lblCurrent", szBuf);
+        snprintf(szBuf, sizeof(szBuf), "%.2f W", m_dPowerW);
+        uiex->setText("lblPower", szBuf);
 
         // Hub temp (SHT40 raw, self-heated) — shown for diagnostics
         if (m_bSensorValid)
