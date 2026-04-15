@@ -369,4 +369,13 @@ private:
     std::thread         m_pollThread;
     std::atomic<bool>   m_bStopPollThread;
     void                pollThreadFunc();
+
+    // Counts consecutive sendFrame() failures (any writeFile or read error).
+    // Reset to 0 on any successful exchange.  When it reaches kReconnectThreshold
+    // the poll thread closes and re-opens the serial port.
+    std::atomic<int>    m_nConsecFailures;
+
+    // Attempt to close and reopen the serial port after persistent failure.
+    // Called only from pollThreadFunc().  Returns true if the link is restored.
+    bool                attemptReconnect();
 };

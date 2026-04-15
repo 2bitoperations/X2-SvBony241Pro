@@ -76,9 +76,12 @@ static const double  kDefaultRegulatedVoltageV  = 12.0;  // 12 V
 static const int           kDefaultDewAggressiveness  = 5;           // mid-range
 static const DewHeaterMode kDefaultDewMode             = DEW_MODE_MANUAL;
 static const DewFallback   kDefaultDewFallback         = DEW_FALLBACK_ON;
-static const int           kDewUpdateIntervalMs        = 30000;       // 30 s background sensor poll rate
-static const int           kDialogPollIntervalMs       = 5000;        //  5 s poll rate while dialog is open
-static const int           kSensorWarmupMs             = 15000; // ESP32 needs ~15s after reset to init sensors
+static const int           kDewUpdateIntervalMs        = 30000;  // 30 s background sensor poll rate
+static const int           kDialogPollIntervalMs       = 5000;   //  5 s poll rate while dialog is open
+static const int           kSensorWarmupMs             = 15000;  // ESP32 needs ~15s after reset to init sensors
+static const int           kFailureRetryMs             = 5000;   // retry interval after a failed poll cycle
+static const int           kReconnectThreshold         = 10;     // consecutive sendFrame failures before reconnect
+static const int           kReconnectSettleMs          = 1500;   // wait after port close before re-open
 
 // Ini section key for persisted dew settings
 static const char* kIniSection = "SV241Pro";
@@ -136,6 +139,7 @@ X2Svbony241Pro::X2Svbony241Pro(
     // them consistent prevents subtle bugs if a later field ever depends on an earlier one.
     , m_bRestoreOnConnect       (false)
     , m_bStopPollThread         (false)
+    , m_nConsecFailures         (0)
 {
     (void)pszDisplayName;   // display name is managed by TheSkyX
 
@@ -716,11 +720,13 @@ int X2Svbony241Pro::sendFrame(const uint8_t* pCmd, int nCmdLen,
     if (nErr != SB_OK)
     {
         logDebug(kDebugErrors, "X2Svbony241Pro: writeFile error %d", nErr);
+        m_nConsecFailures.fetch_add(1);
         return nErr;
     }
     if ((int)nWritten != nFrameLen)
     {
         logDebug(kDebugErrors, "X2Svbony241Pro: short write %lu/%d", nWritten, nFrameLen);
+        m_nConsecFailures.fetch_add(1);
         return ERR_CMDFAILED;
     }
 
@@ -747,7 +753,10 @@ int X2Svbony241Pro::sendFrame(const uint8_t* pCmd, int nCmdLen,
     uint8_t resBuf[32];    // 14 bytes max (cmd 0x08); 32 is safe
     nErr = readFrame(nFullResLen, resBuf);
     if (nErr != SB_OK)
+    {
+        m_nConsecFailures.fetch_add(1);
         return nErr;
+    }
 
     // Flush after read to clear any residual bytes
     m_pSerX->purgeTxRx();
@@ -767,6 +776,7 @@ int X2Svbony241Pro::sendFrame(const uint8_t* pCmd, int nCmdLen,
     {
         logDebug(kDebugErrors, "X2Svbony241Pro: checksum mismatch (got %02X expected %02X)",
                  resBuf[nFullResLen - 1], csExpected);
+        m_nConsecFailures.fetch_add(1);
         return ERR_CMDFAILED;
     }
 
@@ -774,8 +784,12 @@ int X2Svbony241Pro::sendFrame(const uint8_t* pCmd, int nCmdLen,
     if (resBuf[2] == kStatusFailure)
     {
         logDebug(kDebugErrors, "X2Svbony241Pro: device returned failure status (0xAA)");
+        m_nConsecFailures.fetch_add(1);
         return ERR_CMDFAILED;
     }
+
+    // Successful exchange — reset the consecutive-failure counter.
+    m_nConsecFailures.store(0);
 
     // Return the payload bytes to the caller (bytes at offsets 3..3+nResDataLen-1)
     for (int i = 0; i < nResDataLen; ++i)
@@ -1604,6 +1618,10 @@ int X2Svbony241Pro::updateDewControl(bool bForce)
         logDebug(kDebugErrors,
                  "X2Svbony241Pro: SHT40 read failed (errT=%d errH=%d)",
                  nErrT, nErrH);
+        // Back off: stamp the rate-limit clock so the next retry is in
+        // kFailureRetryMs, not immediately on the next 500 ms thread tick.
+        // Without this, persistent port errors (EIO) flood the log at full speed.
+        m_nLastDewUpdateTick = now - (kDewUpdateIntervalMs - kFailureRetryMs);
     }
 
     // INA219 — non-fatal if unavailable; update cache on success.
@@ -1679,11 +1697,126 @@ void X2Svbony241Pro::pollThreadFunc()
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(kSleepIncrementMs));
 
-        if (!m_bStopPollThread.load())
-            updateDewControl(false);  // internally rate-limited to kDewUpdateIntervalMs
+        if (m_bStopPollThread.load())
+            break;
+
+        // If consecutive failures have piled up, attempt to recover the connection
+        // before running the normal poll.  attemptReconnect() closes and re-opens
+        // the port; if it fails we leave m_bLinked false and retry next tick.
+        if (m_nConsecFailures.load() >= kReconnectThreshold)
+        {
+            if (!attemptReconnect())
+            {
+                // Still dead — back off before retrying reconnect.
+                for (int i = 0; i < 6 && !m_bStopPollThread.load(); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(kSleepIncrementMs));
+            }
+            continue;
+        }
+
+        updateDewControl(false);  // internally rate-limited to kDewUpdateIntervalMs
     }
 
     logDebug(kDebugCommands, "X2Svbony241Pro: poll thread stopped");
+}
+
+// ---------------------------------------------------------------------------
+// attemptReconnect
+//
+// Called from pollThreadFunc() when m_nConsecFailures >= kReconnectThreshold.
+// Closes the dead port, waits for USB to settle, then tries to re-open and
+// handshake.  Does not use the DTR/RTS ctrl-fd dance — if the device just
+// reset on its own (ESP32 crash / USB glitch), we attempt a no-reset handshake
+// first; if that fails we drain the boot log and try once more.
+//
+// Returns true and leaves m_bLinked == true on success.
+// Returns false and leaves m_bLinked == false on failure (caller retries later).
+// ---------------------------------------------------------------------------
+bool X2Svbony241Pro::attemptReconnect()
+{
+    logDebug(kDebugErrors,
+             "X2Svbony241Pro: %d consecutive failures — attempting reconnect",
+             m_nConsecFailures.load());
+
+    // Close the dead port.
+    {
+        X2MutexLocker ml(m_pIOMutex);
+        m_bLinked = false;
+        if (m_pSerX)
+            m_pSerX->close();
+    }
+
+    m_nConsecFailures.store(0);  // reset so sendFrame() errors during reconnect are counted fresh
+
+    // Give the OS and USB stack time to settle after the device disappears/reappears.
+    std::this_thread::sleep_for(std::chrono::milliseconds(kReconnectSettleMs));
+
+    if (m_bStopPollThread.load())
+        return false;
+
+    // Re-open the port.
+    std::string sPortName;
+    getPortName(sPortName);
+
+    int nErr = m_pSerX->open(sPortName.c_str(), kBaudRate, SerXInterface::B_NOPARITY, 0);
+    if (nErr != SB_OK)
+    {
+        logDebug(kDebugErrors,
+                 "X2Svbony241Pro: reconnect: port open failed (err %d) — will retry", nErr);
+        return false;
+    }
+
+    // Attempt 1: handshake without reset (device may already be running).
+    {
+        X2MutexLocker ml(m_pIOMutex);
+        m_bLinked = true;
+    }
+
+    uint8_t state10[10] = {0};
+    nErr = cmdGetState(state10);
+    if (nErr == SB_OK)
+    {
+        parseStateResponse(state10);
+        logDebug(kDebugErrors, "X2Svbony241Pro: reconnect OK (device was already running)");
+        return true;
+    }
+
+    // Attempt 2: drain boot log, then handshake (device may have just reset).
+    {
+        X2MutexLocker ml(m_pIOMutex);
+        m_bLinked = false;
+    }
+
+    logDebug(kDebugErrors, "X2Svbony241Pro: reconnect: no response — draining boot log");
+    (void)drainBootLog();
+
+    // Record reset time so updateDewControl() observes the warmup guard.
+    m_nResetTimeTick = m_pTickCount ? m_pTickCount->elapsed() : 0;
+    m_nLastDewUpdateTick = 0;
+
+    {
+        X2MutexLocker ml(m_pIOMutex);
+        m_bLinked = true;
+    }
+
+    memset(state10, 0, sizeof(state10));
+    nErr = cmdGetState(state10);
+    if (nErr == SB_OK)
+    {
+        parseStateResponse(state10);
+        logDebug(kDebugErrors, "X2Svbony241Pro: reconnect OK (after boot drain)");
+        return true;
+    }
+
+    // Both attempts failed — leave unlinked.
+    {
+        X2MutexLocker ml(m_pIOMutex);
+        m_bLinked = false;
+        m_pSerX->close();
+    }
+
+    logDebug(kDebugErrors, "X2Svbony241Pro: reconnect failed — will retry later");
+    return false;
 }
 
 // ---------------------------------------------------------------------------
