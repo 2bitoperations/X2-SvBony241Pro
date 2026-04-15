@@ -7,6 +7,7 @@
 #include <stdarg.h>
 #include <time.h>
 #include <stdlib.h>
+#include <chrono>
 
 #if defined(SB_LINUX_BUILD) || defined(SB_MACOSX_BUILD)
 #  include <fcntl.h>
@@ -134,6 +135,7 @@ X2Svbony241Pro::X2Svbony241Pro(
     // C++ initialises in declaration order, not initialiser-list order; keeping
     // them consistent prevents subtle bugs if a later field ever depends on an earlier one.
     , m_bRestoreOnConnect       (false)
+    , m_bStopPollThread         (false)
 {
     (void)pszDisplayName;   // display name is managed by TheSkyX
 
@@ -499,6 +501,12 @@ int X2Svbony241Pro::establishLink()
     // actual current state before we layer the saved state on top.
     restoreCircuitStates();
 
+    // Start the background polling thread.  It calls updateDewControl() every
+    // kDewUpdateIntervalMs regardless of whether TheSkyX is actively displaying
+    // the Power Control Box panel (which is the only other trigger for circuitState()).
+    m_bStopPollThread.store(false);
+    m_pollThread = std::thread(&X2Svbony241Pro::pollThreadFunc, this);
+
     int nTotalMs = m_pTickCount ? (m_pTickCount->elapsed() - nLinkStartTick) : -1;
     logDebug(kDebugErrors, "X2Svbony241Pro: link established (total=%d ms)", nTotalMs);
 
@@ -510,6 +518,16 @@ int X2Svbony241Pro::terminateLink()
     saveDebugLevel();
     saveDewConfig();
     saveCircuitStates();
+
+    // Signal the background poll thread to stop and wait for it to exit.
+    // Done before closing the port: the thread may be mid-way through
+    // sendFrame() holding or waiting on m_pIOMutex.  Setting m_bLinked=false
+    // (below, under the mutex) causes sendFrame() to return ERR_COMMNOLINK
+    // the next time it runs, after which the thread checks m_bStopPollThread
+    // and exits cleanly.  Max extra wait = one sleep increment (500 ms).
+    m_bStopPollThread.store(true);
+    if (m_pollThread.joinable())
+        m_pollThread.join();
 
     // Clear m_bLinked and close the port under the mutex.  Any thread that is
     // blocked waiting to acquire the lock inside sendFrame() will re-check
@@ -1638,6 +1656,34 @@ int X2Svbony241Pro::updateDewControl(bool bForce)
     }
 
     return SB_OK;
+}
+
+// ---------------------------------------------------------------------------
+// pollThreadFunc
+//
+// Background thread body.  Wakes every 500 ms to check the stop flag; when
+// kDewUpdateIntervalMs has elapsed since the last sensor read, calls
+// updateDewControl() which handles sensor reads, dew-point calculation, and
+// auto-PWM — whether or not TheSkyX is actively calling circuitState().
+//
+// All serial I/O inside updateDewControl() is serialised through m_pIOMutex,
+// so concurrent calls from this thread and from circuitState() are safe.
+// ---------------------------------------------------------------------------
+void X2Svbony241Pro::pollThreadFunc()
+{
+    static const int kSleepIncrementMs = 500;  // granularity for stop-flag checks
+
+    logDebug(kDebugCommands, "X2Svbony241Pro: poll thread started");
+
+    while (!m_bStopPollThread.load())
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(kSleepIncrementMs));
+
+        if (!m_bStopPollThread.load())
+            updateDewControl(false);  // internally rate-limited to kDewUpdateIntervalMs
+    }
+
+    logDebug(kDebugCommands, "X2Svbony241Pro: poll thread stopped");
 }
 
 // ---------------------------------------------------------------------------

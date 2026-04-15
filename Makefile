@@ -24,7 +24,7 @@ else ifeq ($(UNAME_S),Darwin)
 else
   TARGET_LIB  = libx2svbony241pro.so
   OS_FLAG     = -DSB_LINUX_BUILD
-  LDFLAGS     = -shared -lstdc++
+  LDFLAGS     = -shared -lstdc++ -lpthread
   STRIP_FLAGS = --strip-unneeded
 endif
 

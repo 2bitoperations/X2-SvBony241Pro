@@ -17,6 +17,8 @@
 
 #include <stdint.h>
 #include <string>
+#include <thread>
+#include <atomic>
 
 // ---------------------------------------------------------------------------
 // Dew-heater operating mode (per heater)
@@ -356,4 +358,15 @@ private:
     // If true, re-apply the last saved circuit on/off states after establishLink().
     // Persisted as RestoreOnConnect_N in the ini store.
     bool            m_bRestoreOnConnect;
+
+    // -----------------------------------------------------------------------
+    // Background sensor polling thread
+    // -----------------------------------------------------------------------
+    // Calls updateDewControl() every kDewUpdateIntervalMs regardless of whether
+    // TheSkyX is actively polling circuitState() (which only happens when the
+    // Power Control Box panel is visible).  Started in establishLink(), stopped
+    // and joined in terminateLink().
+    std::thread         m_pollThread;
+    std::atomic<bool>   m_bStopPollThread;
+    void                pollThreadFunc();
 };
