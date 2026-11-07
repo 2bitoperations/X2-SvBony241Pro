@@ -168,6 +168,33 @@ private:
     int         readFrame(int nExpectedBytes, uint8_t* pBufOut);
 
     // -----------------------------------------------------------------------
+    // Serial port layer.  All port I/O goes through these.
+    //
+    // The SV241 Pro holds its ESP32 in reset while RTS is asserted, and the
+    // ESP32 switches the USB hub power, so asserting RTS drops every USB device
+    // behind the box.  On Linux the kernel asserts DTR+RTS whenever a serial
+    // port is opened with a non-zero baud rate, so SerXInterface::open() always
+    // resets the box.  On Linux these helpers therefore bypass SerX and drive a
+    // private fd that is kept at baud B0 (see portOpen()).  On macOS and
+    // Windows they wrap m_pSerX.
+    // -----------------------------------------------------------------------
+
+    // Open the port.  bDeviceResetOut is set when opening reset the ESP32
+    // (the caller must then drain the boot log before talking to it).
+    int         portOpen(const std::string& sPortName, bool& bDeviceResetOut);
+    void        portClose();
+    // Deliberately reset the ESP32 (used when a no-reset handshake fails).
+    void        portResetDevice();
+    int         portWrite(const uint8_t* pBuf, int nLen, unsigned long& nWrittenOut);
+    // Wait up to nTimeoutMs for at least one byte.  SB_OK, ERR_RXTIMEOUT or ERR_COMMNOLINK.
+    int         portWaitRx(int nTimeoutMs);
+    // Read up to nLen bytes, waiting up to nTimeoutMs for the first one.
+    // Returns SB_OK with nGotOut == 0 on timeout.
+    int         portRead(uint8_t* pBuf, int nLen, unsigned long& nGotOut, int nTimeoutMs);
+    void        portPurge();
+    void        portFlushTx();
+
+    // -----------------------------------------------------------------------
     // Initialisation helpers
     // -----------------------------------------------------------------------
 
@@ -378,4 +405,8 @@ private:
     // Attempt to close and reopen the serial port after persistent failure.
     // Called only from pollThreadFunc().  Returns true if the link is restored.
     bool                attemptReconnect();
+
+    // Linux: the fd used for all port I/O.  macOS: control fd used only to
+    // drive DTR/RTS alongside m_pSerX.  -1 when closed.  Unused on Windows.
+    int                 m_nPortFd;
 };

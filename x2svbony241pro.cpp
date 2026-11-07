@@ -15,6 +15,7 @@
 #  include <sys/ioctl.h>
 #  include <termios.h>
 #  include <poll.h>
+#  include <errno.h>
 #endif
 
 
@@ -140,6 +141,7 @@ X2Svbony241Pro::X2Svbony241Pro(
     , m_bRestoreOnConnect       (false)
     , m_bStopPollThread         (false)
     , m_nConsecFailures         (0)
+    , m_nPortFd                 (-1)
 {
     (void)pszDisplayName;   // display name is managed by TheSkyX
 
@@ -349,89 +351,24 @@ int X2Svbony241Pro::establishLink()
     loadDebugLevel();
     loadDewConfig();
 
-    // -----------------------------------------------------------------------
-    // Connection strategy for CH341 + ESP32
-    //
-    // The Linux ch341 driver asserts DTR whenever tcsetattr() configures the
-    // port (which SerXInterface::open() triggers internally).  DTR asserted →
-    // CH341 pulls ESP32 EN low → ESP32 held in reset → never responds.
-    //
-    // To work around this we open a private "control" fd BEFORE calling
-    // m_pSerX->open().  Because TIOCEXCL is only set by TSX after its open(),
-    // our fd is guaranteed to open successfully.  We:
-    //
-    //   1. Assert DTR on the ctrl fd  (ESP32 goes into reset — harmless)
-    //   2. Call m_pSerX->open()       (TSX configures the port; device still
-    //                                  in reset so any DTR glitch is a no-op)
-    //   3. Release DTR on the ctrl fd (ESP32 starts booting; boot log flows
-    //                                  into TSX's RX buffer)
-    //   4. drainBootLog()             (consumes boot text through SerXInterface)
-    //   5. Handshake
-    //   6. Close ctrl fd with HUPCL cleared (DTR stays high; ESP32 keeps running)
-    //
-    // Attempt 1 tries without a reset first.  If the device is already running
-    // (e.g. re-connect without unplugging) it responds immediately and we skip
-    // the boot cycle entirely, avoiding any disruption to powered outputs.
-    // -----------------------------------------------------------------------
-
-    // Open the control fd while the port is free (before TSX's TIOCEXCL).
-    int nCtrlFd = -1;
-#if defined(SB_LINUX_BUILD) || defined(SB_MACOSX_BUILD)
-    nCtrlFd = ::open(sPortName.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (nCtrlFd >= 0)
-    {
-        struct termios tio;
-        if (::tcgetattr(nCtrlFd, &tio) == 0)
-        {
-            tio.c_cflag &= ~HUPCL;   // don't drop DTR on close
-            tio.c_cflag |=  CLOCAL;  // ignore carrier detect
-            ::tcsetattr(nCtrlFd, TCSANOW, &tio);
-        }
-        logDebug(kDebugCommands, "X2Svbony241Pro: ctrl fd opened (fd=%d)", nCtrlFd);
-    }
-    else
-    {
-        logDebug(kDebugErrors, "X2Svbony241Pro: ctrl fd open failed (errno=%d) — no DTR control", errno);
-    }
-#endif
-
-    // Helper lambdas to set DTR+RTS via the control fd.
-    // The ESP32 auto-reset circuit on the SV241 Pro is cross-coupled:
-    //   DTR → EN pin (active-low reset)
-    //   RTS → GPIO0 pin (boot-mode select)
-    // Both lines must be asserted together to pull EN low cleanly;
-    // leaving RTS high (as TSX sets it) prevents DTR from fully
-    // resetting the chip.  This replicates the exact esptool sequence.
-#if defined(SB_LINUX_BUILD) || defined(SB_MACOSX_BUILD)
-    auto setDtrRts = [&](bool bAssert) {
-        if (nCtrlFd < 0) return;
-        int modem = 0;
-        ::ioctl(nCtrlFd, TIOCMGET, &modem);
-        if (bAssert) { modem |=  TIOCM_DTR; modem |=  TIOCM_RTS; }
-        else         { modem &= ~TIOCM_DTR; modem &= ~TIOCM_RTS; }
-        ::ioctl(nCtrlFd, TIOCMSET, &modem);
-    };
-    auto closeCtrlFd = [&]() {
-        if (nCtrlFd >= 0) { ::close(nCtrlFd); nCtrlFd = -1; }
-    };
-#else
-    auto setDtrRts   = [&](bool) {};
-    auto closeCtrlFd = [&]() {};
-#endif
-
-    // --- Attempt 1: try without reset ---
-    // Leave DTR in its current state and see if the device is already alive.
-    int nErr = m_pSerX->open(sPortName.c_str(), kBaudRate, SerXInterface::B_NOPARITY, 0);
+    // Open the port.  On Linux this normally does not touch DTR/RTS, so an
+    // already-running box keeps its outputs (and the USB hub) powered.  The
+    // first open after the CH340 enumerates resets the box once; portOpen()
+    // reports that so we drain the boot log first.
+    bool bDeviceReset = false;
+    int nErr = portOpen(sPortName, bDeviceReset);
     if (nErr != SB_OK)
     {
         logDebug(kDebugErrors, "X2Svbony241Pro: serial port open failed (err %d)", nErr);
-        closeCtrlFd();
         return nErr;
     }
 
-    // TSX's open() may have left RTS asserted (or DTR in an unknown state).
-    // Release both now so the ESP32 is free to run if it was held in reset.
-    setDtrRts(false);
+    if (bDeviceReset)
+    {
+        logDebug(kDebugErrors, "X2Svbony241Pro: port open reset the ESP32 — draining boot log");
+        m_nResetTimeTick = m_pTickCount ? m_pTickCount->elapsed() : 0;
+        (void)drainBootLog();
+    }
 
     m_bLinked = true;
     uint8_t state10[10] = {0};
@@ -439,37 +376,24 @@ int X2Svbony241Pro::establishLink()
 
     if (nErr == SB_OK)
     {
-        logDebug(kDebugErrors, "X2Svbony241Pro: handshake OK on first attempt");
-        closeCtrlFd();
+        logDebug(kDebugErrors, "X2Svbony241Pro: handshake OK on first attempt%s",
+                 bDeviceReset ? " (after open reset)" : " (no reset)");
     }
     else
     {
-        // First attempt failed.
         int nFirstFailMs = m_pTickCount ? (m_pTickCount->elapsed() - nLinkStartTick) : -1;
         logDebug(kDebugErrors,
                  "X2Svbony241Pro: first attempt failed at +%d ms (err %d) — doing ESP32 reset",
                  nFirstFailMs, nErr);
         m_bLinked = false;
 
-        // Assert DTR+RTS together → ESP32 in reset (200ms), then release both.
-        // The SV241 Pro uses the standard ESP32 auto-reset circuit:
-        //   DTR → EN (active-low reset), RTS → GPIO0 (boot-mode select).
-        // The transistors are cross-coupled so both lines must be asserted
-        // to pull EN cleanly low.  Releasing both lets the chip boot normally.
-        setDtrRts(true);
-
-        struct timespec ts200 = { 0, 200000000L };
-        ::nanosleep(&ts200, NULL);
-
-        setDtrRts(false);
+        portResetDevice();
 
         // Record the reset time so updateDewControl() can defer sensor reads
         // until the INA219 and SHT40 are ready (~15 s after reset).
         m_nResetTimeTick = m_pTickCount ? m_pTickCount->elapsed() : 0;
 
-        logDebug(kDebugErrors, "X2Svbony241Pro: DTR+RTS released — draining boot log");
-
-        // Drain the boot log that will appear in TSX's RX buffer as the ESP32 boots.
+        logDebug(kDebugErrors, "X2Svbony241Pro: reset released — draining boot log");
         (void)drainBootLog();
 
         int nAfterDrainMs = m_pTickCount ? (m_pTickCount->elapsed() - nLinkStartTick) : -1;
@@ -481,9 +405,6 @@ int X2Svbony241Pro::establishLink()
         memset(state10, 0, sizeof(state10));
         nErr = cmdGetState(state10);
 
-        // Done with the ctrl fd regardless of handshake outcome.
-        closeCtrlFd();
-
         if (nErr != SB_OK)
         {
             int nFailMs = m_pTickCount ? (m_pTickCount->elapsed() - nLinkStartTick) : -1;
@@ -491,11 +412,11 @@ int X2Svbony241Pro::establishLink()
                      "X2Svbony241Pro: handshake failed after reset at +%d ms (err %d) — closing",
                      nFailMs, nErr);
             m_bLinked = false;
-            m_pSerX->close();
+            portClose();
             return nErr;
         }
 
-        logDebug(kDebugErrors, "X2Svbony241Pro: handshake OK after DTR reset");
+        logDebug(kDebugErrors, "X2Svbony241Pro: handshake OK after reset");
     }
 
     parseStateResponse(state10);
@@ -540,8 +461,7 @@ int X2Svbony241Pro::terminateLink()
     {
         X2MutexLocker ml(m_pIOMutex);
         m_bLinked = false;
-        if (m_pSerX != NULL)
-            m_pSerX->close();
+        portClose();
     }
 
     logDebug(kDebugCommands, "X2Svbony241Pro: link terminated");
@@ -712,11 +632,11 @@ int X2Svbony241Pro::sendFrame(const uint8_t* pCmd, int nCmdLen,
     buildFrame(pCmd, nCmdLen, frame, nFrameLen);
 
     // Flush stale bytes before writing
-    m_pSerX->purgeTxRx();
+    portPurge();
 
     // Write command frame
     unsigned long nWritten = 0;
-    int nErr = m_pSerX->writeFile(frame, (unsigned long)nFrameLen, nWritten);
+    int nErr = portWrite(frame, nFrameLen, nWritten);
     if (nErr != SB_OK)
     {
         logDebug(kDebugErrors, "X2Svbony241Pro: writeFile error %d", nErr);
@@ -732,7 +652,7 @@ int X2Svbony241Pro::sendFrame(const uint8_t* pCmd, int nCmdLen,
 
     // Force bytes out of the OS TX buffer — equivalent to INDI's tcdrain().
     // Without this, bytes may sit in the kernel buffer and never reach the device.
-    m_pSerX->flushTx();
+    portFlushTx();
 
     if (m_nDebugLevel >= kDebugFullIO)
     {
@@ -759,7 +679,7 @@ int X2Svbony241Pro::sendFrame(const uint8_t* pCmd, int nCmdLen,
     }
 
     // Flush after read to clear any residual bytes
-    m_pSerX->purgeTxRx();
+    portPurge();
 
     if (m_nDebugLevel >= kDebugFullIO)
     {
@@ -817,7 +737,7 @@ int X2Svbony241Pro::readFrame(int nExpectedBytes, uint8_t* pBufOut)
     while (nRead < nExpectedBytes)
     {
         // Wait for at least one more byte within our deadline.
-        int nErr = m_pSerX->waitForBytesRx(1, kReadTimeoutMs);
+        int nErr = portWaitRx(kReadTimeoutMs);
         if (nErr != SB_OK)
         {
             logDebug(kDebugErrors,
@@ -826,12 +746,9 @@ int X2Svbony241Pro::readFrame(int nExpectedBytes, uint8_t* pBufOut)
             return ERR_TXTIMEOUT;
         }
 
-        // Drain whatever arrived — readFile with a short timeout to avoid blocking.
+        // Drain whatever arrived — short timeout to avoid blocking.
         unsigned long nGot = 0;
-        nErr = m_pSerX->readFile(pBufOut + nRead,
-                                 (unsigned long)(nExpectedBytes - nRead),
-                                 nGot,
-                                 (unsigned long)kReadTimeoutMs);
+        nErr = portRead(pBufOut + nRead, nExpectedBytes - nRead, nGot, kReadTimeoutMs);
         if (nErr != SB_OK)
         {
             logDebug(kDebugErrors, "X2Svbony241Pro: readFile error %d", nErr);
@@ -842,6 +759,290 @@ int X2Svbony241Pro::readFrame(int nExpectedBytes, uint8_t* pBufOut)
     }
 
     return SB_OK;
+}
+
+// ===========================================================================
+// Serial port layer
+//
+// Measured on the SV241 Pro (CH340 + ESP32 auto-reset circuit):
+//   RTS asserted (either DTR state) -> ESP32 held in reset, USB hub unpowered
+//   RTS released                    -> ESP32 runs (boots, if it was held)
+//   DTR                             -> no effect on its own
+//
+// Linux ch341 driver behaviour this relies on:
+//   - open() asserts DTR+RTS unless the port's saved termios speed is B0.
+//     Clearing them immediately afterwards is too late: a 0.8 ms pulse
+//     still resets the ESP32.
+//   - Changing the speed from B0 to a real rate asserts DTR+RTS.
+//   - Setting B0 drops DTR+RTS but does not reprogram the chip, which keeps
+//     running at its last real rate (115200 8N1) and passes data normally.
+//   - usb-serial keeps termios across close/open until the device re-enumerates.
+// So the port is left at B0 permanently: every later open is reset-free.
+// ===========================================================================
+
+#if defined(SB_LINUX_BUILD)
+// Configure fd as raw 8N1, no flow control, no hang-up on close, at nSpeed.
+static bool configurePort(int nFd, speed_t nSpeed)
+{
+    struct termios tio;
+    if (::tcgetattr(nFd, &tio) != 0)
+        return false;
+    ::cfmakeraw(&tio);
+    tio.c_cflag |= (CLOCAL | CREAD);
+    tio.c_cflag &= ~(HUPCL | CRTSCTS | CSTOPB);
+    tio.c_cc[VMIN]  = 0;
+    tio.c_cc[VTIME] = 0;
+    ::cfsetispeed(&tio, nSpeed);
+    ::cfsetospeed(&tio, nSpeed);
+    return ::tcsetattr(nFd, TCSANOW, &tio) == 0;
+}
+
+static void releaseModemLines(int nFd)
+{
+    int nLines = TIOCM_DTR | TIOCM_RTS;   // one ioctl, so both change together
+    ::ioctl(nFd, TIOCMBIC, &nLines);
+}
+#endif
+
+int X2Svbony241Pro::portOpen(const std::string& sPortName, bool& bDeviceResetOut)
+{
+    bDeviceResetOut = false;
+    portClose();
+
+#if defined(SB_LINUX_BUILD)
+    int nFd = ::open(sPortName.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (nFd < 0)
+    {
+        logDebug(kDebugErrors, "X2Svbony241Pro: open(%s) failed (errno=%d)", sPortName.c_str(), errno);
+        return ERR_COMMNOLINK;
+    }
+
+    struct termios tio;
+    if (::tcgetattr(nFd, &tio) != 0)
+    {
+        logDebug(kDebugErrors, "X2Svbony241Pro: tcgetattr failed (errno=%d)", errno);
+        ::close(nFd);
+        return ERR_COMMNOLINK;
+    }
+
+    const bool bWasB0 = (::cfgetospeed(&tio) == B0);
+    if (!bWasB0)
+    {
+        // First open since the CH340 enumerated: the kernel has just asserted
+        // DTR+RTS, so the ESP32 is in reset.  Program the chip for 115200 8N1
+        // while it is held (no line change: the speed was already non-zero).
+        if (!configurePort(nFd, B115200))
+        {
+            logDebug(kDebugErrors, "X2Svbony241Pro: tcsetattr(115200) failed (errno=%d)", errno);
+            ::close(nFd);
+            return ERR_COMMNOLINK;
+        }
+        bDeviceResetOut = true;
+    }
+
+    // Drop to B0: releases DTR+RTS (letting the ESP32 boot if it was held) and
+    // leaves B0 saved so the next open does not reset the box.
+    if (!configurePort(nFd, B0))
+    {
+        logDebug(kDebugErrors, "X2Svbony241Pro: tcsetattr(B0) failed (errno=%d)", errno);
+        ::close(nFd);
+        return ERR_COMMNOLINK;
+    }
+    releaseModemLines(nFd);
+
+    // Match SerXInterface: keep other programs off the port while linked.
+    if (::ioctl(nFd, TIOCEXCL) != 0)
+        logDebug(kDebugErrors, "X2Svbony241Pro: TIOCEXCL failed (errno=%d) — continuing", errno);
+
+    ::tcflush(nFd, TCIOFLUSH);
+    m_nPortFd = nFd;
+    logDebug(kDebugCommands, "X2Svbony241Pro: port open (fd=%d, %s)", nFd,
+             bWasB0 ? "held at B0, no reset" : "first open after enumeration, ESP32 reset");
+    return SB_OK;
+
+#else
+    if (m_pSerX == NULL)
+        return ERR_COMMNOLINK;
+
+#  if defined(SB_MACOSX_BUILD)
+    // Control fd for DTR/RTS, opened before TSX's open() sets TIOCEXCL.
+    m_nPortFd = ::open(sPortName.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (m_nPortFd >= 0)
+    {
+        struct termios tio;
+        if (::tcgetattr(m_nPortFd, &tio) == 0)
+        {
+            tio.c_cflag &= ~HUPCL;   // don't drop lines on close
+            tio.c_cflag |=  CLOCAL;
+            ::tcsetattr(m_nPortFd, TCSANOW, &tio);
+        }
+    }
+    else
+    {
+        logDebug(kDebugErrors, "X2Svbony241Pro: ctrl fd open failed (errno=%d) — no DTR/RTS control", errno);
+    }
+#  endif
+
+    int nErr = m_pSerX->open(sPortName.c_str(), kBaudRate, SerXInterface::B_NOPARITY, 0);
+    if (nErr != SB_OK)
+    {
+        portClose();
+        return nErr;
+    }
+
+#  if defined(SB_MACOSX_BUILD)
+    // Release RTS in case open() asserted it and is holding the ESP32 in reset.
+    if (m_nPortFd >= 0)
+    {
+        int nLines = TIOCM_DTR | TIOCM_RTS;
+        ::ioctl(m_nPortFd, TIOCMBIC, &nLines);
+    }
+#  endif
+    return SB_OK;
+#endif
+}
+
+void X2Svbony241Pro::portClose()
+{
+#if defined(SB_LINUX_BUILD)
+    if (m_nPortFd >= 0)
+    {
+        // Saved speed is B0 and HUPCL is off: closing changes no modem lines.
+        ::close(m_nPortFd);
+        m_nPortFd = -1;
+    }
+#else
+    if (m_pSerX != NULL && m_pSerX->isConnected())
+        m_pSerX->close();
+#  if defined(SB_MACOSX_BUILD)
+    if (m_nPortFd >= 0)
+    {
+        ::close(m_nPortFd);
+        m_nPortFd = -1;
+    }
+#  endif
+#endif
+}
+
+void X2Svbony241Pro::portResetDevice()
+{
+    struct timespec ts200 = { 0, 200000000L };
+#if defined(SB_LINUX_BUILD)
+    if (m_nPortFd < 0)
+        return;
+    // Leaving B0 asserts DTR+RTS (reset) and reprograms the chip for 115200
+    // 8N1, which also recovers a port left at B0 by another program at a
+    // different speed.  Returning to B0 releases the reset.
+    if (!configurePort(m_nPortFd, B115200))
+        logDebug(kDebugErrors, "X2Svbony241Pro: reset: tcsetattr(115200) failed (errno=%d)", errno);
+    ::nanosleep(&ts200, NULL);
+    if (!configurePort(m_nPortFd, B0))
+        logDebug(kDebugErrors, "X2Svbony241Pro: reset: tcsetattr(B0) failed (errno=%d)", errno);
+    releaseModemLines(m_nPortFd);
+    ::tcflush(m_nPortFd, TCIOFLUSH);
+#elif defined(SB_MACOSX_BUILD)
+    if (m_nPortFd < 0)
+        return;
+    int nLines = TIOCM_DTR | TIOCM_RTS;
+    ::ioctl(m_nPortFd, TIOCMBIS, &nLines);   // RTS asserted -> ESP32 in reset
+    ::nanosleep(&ts200, NULL);
+    ::ioctl(m_nPortFd, TIOCMBIC, &nLines);   // released -> ESP32 boots
+#else
+    (void)ts200;   // Windows: SerX gives no line control; rely on drain + retry
+#endif
+}
+
+int X2Svbony241Pro::portWrite(const uint8_t* pBuf, int nLen, unsigned long& nWrittenOut)
+{
+    nWrittenOut = 0;
+#if defined(SB_LINUX_BUILD)
+    if (m_nPortFd < 0)
+        return ERR_COMMNOLINK;
+    while ((int)nWrittenOut < nLen)
+    {
+        ssize_t n = ::write(m_nPortFd, pBuf + nWrittenOut, (size_t)(nLen - (int)nWrittenOut));
+        if (n > 0)
+        {
+            nWrittenOut += (unsigned long)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0 && errno == EAGAIN)
+        {
+            struct pollfd pfd = { m_nPortFd, POLLOUT, 0 };
+            if (::poll(&pfd, 1, kReadTimeoutMs) <= 0)
+                return ERR_TXTIMEOUT;
+            continue;
+        }
+        logDebug(kDebugErrors, "X2Svbony241Pro: write failed (errno=%d)", errno);
+        return ERR_COMMNOLINK;
+    }
+    return SB_OK;
+#else
+    return m_pSerX->writeFile((void*)pBuf, (unsigned long)nLen, nWrittenOut);
+#endif
+}
+
+int X2Svbony241Pro::portWaitRx(int nTimeoutMs)
+{
+#if defined(SB_LINUX_BUILD)
+    if (m_nPortFd < 0)
+        return ERR_COMMNOLINK;
+    struct pollfd pfd = { m_nPortFd, POLLIN, 0 };
+    int r;
+    do { r = ::poll(&pfd, 1, nTimeoutMs); } while (r < 0 && errno == EINTR);
+    if (r < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
+        return ERR_COMMNOLINK;   // device gone (unplugged / re-enumerated)
+    return (r > 0) ? SB_OK : ERR_RXTIMEOUT;
+#else
+    return m_pSerX->waitForBytesRx(1, nTimeoutMs);
+#endif
+}
+
+int X2Svbony241Pro::portRead(uint8_t* pBuf, int nLen, unsigned long& nGotOut, int nTimeoutMs)
+{
+    nGotOut = 0;
+#if defined(SB_LINUX_BUILD)
+    int nErr = portWaitRx(nTimeoutMs);
+    if (nErr == ERR_RXTIMEOUT)
+        return SB_OK;
+    if (nErr != SB_OK)
+        return nErr;
+    ssize_t n;
+    do { n = ::read(m_nPortFd, pBuf, (size_t)nLen); } while (n < 0 && errno == EINTR);
+    if (n < 0 && errno == EAGAIN)
+        return SB_OK;
+    if (n < 0)
+    {
+        logDebug(kDebugErrors, "X2Svbony241Pro: read failed (errno=%d)", errno);
+        return ERR_COMMNOLINK;
+    }
+    nGotOut = (unsigned long)n;
+    return SB_OK;
+#else
+    return m_pSerX->readFile(pBuf, (unsigned long)nLen, nGotOut, (unsigned long)nTimeoutMs);
+#endif
+}
+
+void X2Svbony241Pro::portPurge()
+{
+#if defined(SB_LINUX_BUILD)
+    if (m_nPortFd >= 0)
+        ::tcflush(m_nPortFd, TCIOFLUSH);
+#else
+    m_pSerX->purgeTxRx();
+#endif
+}
+
+void X2Svbony241Pro::portFlushTx()
+{
+#if defined(SB_LINUX_BUILD)
+    if (m_nPortFd >= 0)
+        ::tcdrain(m_nPortFd);
+#else
+    m_pSerX->flushTx();
+#endif
 }
 
 // ===========================================================================
@@ -935,7 +1136,7 @@ int X2Svbony241Pro::drainBootLog()
         // which completely defeats the kBootDrainMaxMs wall-clock cap (the cap
         // is only checked at the top of the loop, so each readFile call can add
         // a full second of latency before the cap fires on the next iteration).
-        m_pSerX->readFile(discard, sizeof(discard), nRead, kBootDrainReadTimeoutMs);
+        (void)portRead(discard, (int)sizeof(discard), nRead, kBootDrainReadTimeoutMs);
         nTotalRead += (int)nRead;
 
         if (nRead == 0)
@@ -945,7 +1146,7 @@ int X2Svbony241Pro::drainBootLog()
     }
 
     // Final flush of any residual bytes in the kernel buffer.
-    m_pSerX->purgeTxRx();
+    portPurge();
 
     int nTotalElapsed = m_pTickCount ? (m_pTickCount->elapsed() - nDrainStartTick) : -1;
     logDebug(kDebugCommands,
@@ -1142,11 +1343,12 @@ int X2Svbony241Pro::cmdPowerCycle()
         int nFrameLen = 0;
         buildFrame(pCmd, nCmdLen, frame, nFrameLen);
 
-        m_pSerX->purgeTxRx();
+        portPurge();
 
         unsigned long nWritten = 0;
-        int nErr = m_pSerX->writeFile(frame, (unsigned long)nFrameLen, nWritten);
+        int nErr = portWrite(frame, nFrameLen, nWritten);
         if (nErr != SB_OK) return nErr;
+        portFlushTx();
         if ((int)nWritten != nFrameLen) return ERR_CMDFAILED;
 
         if (m_pSleeper)
@@ -1158,7 +1360,7 @@ int X2Svbony241Pro::cmdPowerCycle()
         nErr = readFrame(kResLen, res);
         if (nErr != SB_OK) return nErr;
 
-        m_pSerX->purgeTxRx();
+        portPurge();
 
         uint8_t csExpected = calcChecksum(res, kResLen - 1);
         if (res[kResLen - 1] != csExpected) return ERR_CMDFAILED;
@@ -1742,8 +1944,7 @@ bool X2Svbony241Pro::attemptReconnect()
     {
         X2MutexLocker ml(m_pIOMutex);
         m_bLinked = false;
-        if (m_pSerX)
-            m_pSerX->close();
+        portClose();
     }
 
     m_nConsecFailures.store(0);  // reset so sendFrame() errors during reconnect are counted fresh
@@ -1758,12 +1959,21 @@ bool X2Svbony241Pro::attemptReconnect()
     std::string sPortName;
     getPortName(sPortName);
 
-    int nErr = m_pSerX->open(sPortName.c_str(), kBaudRate, SerXInterface::B_NOPARITY, 0);
+    bool bDeviceReset = false;
+    int nErr = portOpen(sPortName, bDeviceReset);
     if (nErr != SB_OK)
     {
         logDebug(kDebugErrors,
                  "X2Svbony241Pro: reconnect: port open failed (err %d) — will retry", nErr);
         return false;
+    }
+    if (bDeviceReset)
+    {
+        // The USB device re-enumerated, so this first open reset the ESP32.
+        logDebug(kDebugErrors, "X2Svbony241Pro: reconnect: port open reset the ESP32 — draining boot log");
+        m_nResetTimeTick = m_pTickCount ? m_pTickCount->elapsed() : 0;
+        m_nLastDewUpdateTick = 0;
+        (void)drainBootLog();
     }
 
     // Attempt 1: handshake without reset (device may already be running).
@@ -1812,7 +2022,7 @@ bool X2Svbony241Pro::attemptReconnect()
     {
         X2MutexLocker ml(m_pIOMutex);
         m_bLinked = false;
-        m_pSerX->close();
+        portClose();
     }
 
     logDebug(kDebugErrors, "X2Svbony241Pro: reconnect failed — will retry later");

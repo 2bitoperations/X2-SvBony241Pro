@@ -60,6 +60,25 @@ When renaming a widget, update the matching `strcmp` in `uiEvent()`.
 `geometry` and `minimumSize` properties — dialog size is controlled by TheSkyX
 internally. Two-column `QHBoxLayout` also does not render correctly.
 
+## Serial port and the ESP32 reset (Linux)
+
+Measured on hardware (CH340 + ESP32 auto-reset circuit):
+
+| Lines | ESP32 |
+|---|---|
+| RTS asserted (any DTR) | Held in reset — USB hub power drops, every USB device behind the box disconnects |
+| RTS released | Runs (boots if it was held) |
+| DTR alone | No effect |
+
+The Linux `ch341` driver asserts DTR+RTS on every `open()` unless the saved
+termios speed is `B0`, and again whenever the speed changes from `B0` to a real
+rate. So `SerXInterface::open()` always resets the box. On Linux all port I/O
+goes through the `port*()` helpers on a private fd that is left at `B0`: the
+chip keeps running at its last real rate (115200 8N1), and later opens never
+touch RTS. Only the first open after the CH340 enumerates resets the box.
+Do not route Linux I/O back through `m_pSerX`, and do not set a real baud on
+the fd except in `portOpen()`/`portResetDevice()`.
+
 ## Sensor decoding
 
 Firmware encoding: `wire_value = (physical + offset) × 100` as big-endian uint32.
@@ -81,6 +100,9 @@ Offsets: DS18B20 = 255.5, SHT40 temp/RH = 254.0.
 | Magnus Psat correction on SHT40 RH | Overcorrects in open enclosure |
 | DS18B20 decode as int16 × 0.0625 | Wrong formula; firmware uses offset encoding |
 | Blocking `nanosleep` in `establishLink()` | Hangs TSX UI thread 5–15 s |
+| Opening via `SerXInterface` on Linux | Kernel asserts RTS on open → ESP32 reset → USB hub power drop on every connect |
+| Clearing DTR/RTS right after `open()` | Too late: a 0.8 ms RTS pulse still resets the ESP32 |
+| Asserting DTR+RTS together "to keep the ESP32 running" | Wrong: RTS asserted *is* the reset; only releasing RTS lets it run |
 | Reading sensors before warmup guard | ESP32 returns sentinel values for ~15 s post-reset |
 | `geometry`/`minimumSize` in .ui | Ignored by `X2ModalUIUtil` |
 | Two-column `QHBoxLayout` | Does not render correctly under TheSkyX's `QUiLoader` |

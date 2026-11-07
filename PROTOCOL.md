@@ -649,6 +649,8 @@ ioctl(PortFD, TIOCMSET, &flags);
 
 Clearing both RTS and DTR triggers the ESP32 hardware reset via the standard Arduino/ESP32 auto-reset circuit.
 
+> **Measured on the SV241 Pro (X2 driver):** the reset is actually caused by the kernel asserting RTS when the port is opened; clearing the lines *releases* it and the ESP32 boots. RTS asserted holds the ESP32 in reset regardless of DTR, and DTR alone has no effect. While the ESP32 is in reset the USB hub is unpowered. The X2 driver avoids the reset on Linux by keeping the port's saved speed at `B0` (see AGENTS.md).
+
 ### 13.3 Step 3 — Wait for Boot Log to Drain
 
 The ESP32 emits a boot log over serial before the firmware is ready. The driver reads it line by line (using `tty_nread_section_expanded` with newline `'\n'` as the section terminator) and waits until none of the following substrings appear in a received line:
